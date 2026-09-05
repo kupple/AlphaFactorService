@@ -483,6 +483,44 @@ def test_model_score_range_query_freezes_one_revision_and_bounded_dates(monkeypa
     }
 
 
+@pytest.mark.parametrize("endpoint", ["jobs", "experiments"])
+@pytest.mark.parametrize("second_limit,expected_status", [(720, 201), (240, 409)])
+def test_distributed_submission_validates_each_real_node(monkeypatch, endpoint, second_limit, expected_status):
+    from factor_service.research import remote
+
+    repository = _Repository()
+    client = _client(monkeypatch, repository, _Scheduler())
+    checked = []
+
+    def get_node(node_id):
+        assert node_id in {"cpu-a", "cpu-b"}
+        checked.append(node_id)
+        return SimpleNamespace(name=node_id, max_runtime_minutes=720 if node_id == "cpu-a" else second_limit)
+
+    monkeypatch.setattr(remote, "get_remote_node", get_node)
+    execution = {"mode": "distributed", "node_id": "distributed", "node_ids": ["cpu-a", "cpu-b"], "max_runtime_minutes": 720}
+    response = client.post(f"/model-research/{endpoint}", json={"title": "distributed", "execution": execution})
+    assert response.status_code == expected_status, response.text
+    assert checked == ["cpu-a", "cpu-b"]
+    if expected_status == 201 and endpoint == "jobs":
+        assert repository.created_payload["execution"] == execution
+    if expected_status == 409:
+        assert "cpu-b" in response.json()["detail"]
+        assert not hasattr(repository, "created_payload")
+
+
+@pytest.mark.parametrize("nodes", [["cpu-a", "local"], ["cpu-a", "cpu-a"], ["distributed"]])
+def test_distributed_submission_rejects_invalid_nodes_before_lookup(monkeypatch, nodes):
+    from factor_service.research import remote
+
+    repository = _Repository()
+    client = _client(monkeypatch, repository, _Scheduler())
+    monkeypatch.setattr(remote, "get_remote_node", lambda node_id: pytest.fail("invalid nodes must not be resolved"))
+    response = client.post("/model-research/jobs", json={"title": "invalid", "execution": {"node_ids": nodes}})
+    assert response.status_code == 400
+    assert not hasattr(repository, "created_payload")
+
+
 def test_training_job_freezes_configured_database_binding(monkeypatch) -> None:
     repository = _Repository()
     client = _client(monkeypatch, repository, _Scheduler())

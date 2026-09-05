@@ -10,7 +10,7 @@ import pytest
 
 from factor_service.research import remote_runner, runtime_resources
 from factor_service.research.runtime_resources import (
-    GIB, MIB, RuntimeResources, read_runtime_resources, snapshot_memory_estimate,
+    GIB, MIB, RuntimeMemoryGuard, RuntimeResources, read_runtime_resources, snapshot_memory_estimate,
 )
 
 
@@ -110,6 +110,56 @@ def test_snapshot_estimate_scales_with_data_not_window_count():
     assert snapshot_memory_estimate(6_340_347, 100) > estimate
 
 
+def _darwin_probe(monkeypatch, *, vm=None, hardware=None, rss="1024"):
+    monkeypatch.setattr(runtime_resources.sys, "platform", "darwin")
+    outputs = {
+        "/usr/sbin/sysctl": hardware if hardware is not None else f"{16 * GIB}\n10",
+        "/usr/bin/vm_stat": vm if vm is not None else (
+            "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n"
+            "Pages free: 65536.\nPages inactive: 196608.\nPages speculative: 65536.\n"
+            "Pages purgeable: 65536.\nPages occupied by compressor: 65536.\n"
+        ),
+        "/bin/ps": rss,
+    }
+    monkeypatch.setattr(runtime_resources, "_command_output", lambda args: outputs[args[0]])
+
+
+def test_darwin_uses_actual_page_size_without_double_counting_reclaimable_memory(monkeypatch):
+    _darwin_probe(monkeypatch)
+    result = read_runtime_resources(pid=42)
+    assert result.memory_source == "darwin_vm_stat"
+    assert result.cpu_cores == 10
+    assert result.memory_limit_bytes == 16 * GIB
+    assert result.memory_available_bytes == 5 * GIB
+    assert result.process_rss_bytes == MIB
+    assert result.training_headroom_bytes == 5 * GIB - int(2.4 * GIB)
+
+
+@pytest.mark.parametrize("vm,hardware", [("", None), (None, ""), ("Pages free: 100.", None)])
+def test_darwin_missing_memory_probe_fails_closed(monkeypatch, vm, hardware):
+    _darwin_probe(monkeypatch, vm=vm, hardware=hardware)
+    assert read_runtime_resources().memory_limit_bytes == 0
+    assert read_runtime_resources().memory_source == "unavailable"
+
+
+def test_darwin_4k_pages_clamp_capacity_and_allow_exited_pid(monkeypatch):
+    _darwin_probe(monkeypatch, hardware=f"{2 * GIB}\n4", rss="", vm=(
+        "Mach Virtual Memory Statistics: (page size of 4096 bytes)\n"
+        "Pages free: 524288.\nPages inactive: 524288.\nPages speculative: 0.\n"
+    ))
+    result = read_runtime_resources(pid=999999)
+    assert result.memory_available_bytes == result.memory_limit_bytes == 2 * GIB
+    assert result.process_rss_bytes == 0
+
+
+def test_resource_probe_timeout_does_not_bypass_guard(monkeypatch):
+    def timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(args[0], 2)
+    monkeypatch.setattr(runtime_resources.subprocess, "run", timeout)
+    monkeypatch.setattr(runtime_resources.sys, "platform", "darwin")
+    assert read_runtime_resources().memory_source == "unavailable"
+
+
 def _args(tmp_path):
     return Namespace(
         job_path=tmp_path / "job.json", work_dir=tmp_path / "work",
@@ -123,7 +173,7 @@ def _resources(available=12 * GIB):
 
 
 @pytest.mark.parametrize("resources,code", [
-    (_resources(GIB), "node_memory_budget_exceeded"),
+    (_resources(128 * MIB), "node_memory_budget_exceeded"),
     (RuntimeResources(1, 0, 0, "unavailable"), "node_resource_unavailable"),
 ])
 def test_supervisor_rejects_node_before_starting_child(tmp_path, monkeypatch, resources, code):
@@ -138,7 +188,7 @@ def test_supervisor_rejects_node_before_starting_child(tmp_path, monkeypatch, re
 
 def test_supervisor_limits_threads_and_stops_only_owned_child_on_pressure(tmp_path, monkeypatch):
     args = _args(tmp_path)
-    samples = iter([_resources(), _resources(), _resources(GIB)])
+    samples = iter([_resources(), _resources(), *[_resources(600 * MIB)] * 3])
     monkeypatch.setattr(remote_runner, "read_runtime_resources", lambda **_: next(samples))
     monkeypatch.setattr(remote_runner.time, "sleep", lambda _: None)
     monkeypatch.setenv("ALPHA_EFFECTIVE_NUM_THREADS", "32")
@@ -227,7 +277,7 @@ def test_memory_guard_cleans_descendants_after_leader_exit(monkeypatch):
     assert calls == [(123, remote_runner.signal.SIGKILL)]
 
 
-def test_dataset_memory_preflight_rejects_before_snapshot_loading(tmp_path, monkeypatch):
+def test_dataset_memory_estimate_warns_but_attempts_training(tmp_path, monkeypatch):
     from factor_service.research import job, trainer
 
     args = _args(tmp_path)
@@ -238,10 +288,64 @@ def test_dataset_memory_preflight_rejects_before_snapshot_loading(tmp_path, monk
         "row_count": 100_000_000, "feature_names": [f"f{i}" for i in range(16)],
     }))
     monkeypatch.setattr(remote_runner, "read_runtime_resources", lambda **_: _resources())
-    monkeypatch.setattr(trainer.QlibTrainer, "train", lambda *a, **k: pytest.fail("must not load or train"))
-    with pytest.raises(SystemExit) as caught:
+    class TrainingAttempted(Exception):
+        pass
+
+    def attempt(*a, **k):
+        raise TrainingAttempted
+
+    monkeypatch.setattr(trainer.QlibTrainer, "train", attempt)
+    with pytest.raises(TrainingAttempted):
         remote_runner._train(args)
+    events = [json.loads(line) for line in args.progress_path.read_text().splitlines()]
+    assert any(e['stage'] == 'memory_preflight_warning' for e in events)
+    assert not (tmp_path / "remote_failure.json").exists()
+
+
+def test_runtime_margin_is_not_the_advisory_fifteen_percent_reserve():
+    resources = _resources(2 * GIB)
+    assert resources.training_headroom_bytes == 0
+    assert resources.runtime_reserve_bytes == int(0.8 * GIB)
+    assert not RuntimeMemoryGuard().observe(resources)
+
+
+def test_runtime_pressure_must_persist_and_resets_after_recovery():
+    guard = RuntimeMemoryGuard()
+    low = _resources(600 * MIB)
+    assert not guard.observe(low)
+    assert not guard.observe(low)
+    assert not guard.observe(_resources(2 * GIB))
+    assert guard.low_samples == 0
+    assert not guard.observe(low)
+    assert not guard.observe(low)
+    assert guard.observe(low)
+    assert RuntimeMemoryGuard().observe(_resources(128 * MIB))
+
+
+def test_runtime_floor_is_bounded_for_small_and_large_nodes():
+    assert RuntimeResources(1, 2 * GIB, GIB, 'host').runtime_reserve_bytes == 512 * MIB
+    assert RuntimeResources(1, 128 * GIB, 64 * GIB, 'host').runtime_reserve_bytes == GIB
+
+
+def test_supervisor_allows_attempt_below_advisory_reserve(tmp_path, monkeypatch):
+    monkeypatch.setattr(remote_runner, "read_runtime_resources", lambda **_: _resources(2 * GIB))
+    child = SimpleNamespace(pid=123, poll=lambda: 0)
+    monkeypatch.setattr(remote_runner.os, "killpg", lambda *args: None)
+    monkeypatch.setattr(remote_runner.subprocess, "Popen", lambda *a, **k: child)
+    assert remote_runner._supervise(_args(tmp_path)) == 0
+
+
+def test_python_memory_error_is_reported_as_node_memory_failure(tmp_path, monkeypatch):
+    args = _args(tmp_path)
+    monkeypatch.setattr(remote_runner.argparse.ArgumentParser, "parse_args", lambda _self: Namespace(
+        **vars(args), training_child=True))
+    monkeypatch.setattr(remote_runner, "read_runtime_resources", lambda **_: _resources(GIB))
+
+    def fail(_args):
+        raise MemoryError('allocation failed')
+
+    monkeypatch.setattr(remote_runner, "_train", fail)
+    with pytest.raises(SystemExit) as caught:
+        remote_runner.main()
     assert caught.value.code == 78
-    failure = json.loads((tmp_path / "remote_failure.json").read_text())
-    assert failure["error_code"] == "node_memory_budget_exceeded"
-    assert "未加载完整数据集" in failure["message"]
+    assert json.loads((tmp_path / "remote_failure.json").read_text())["error_code"] == "node_out_of_memory"

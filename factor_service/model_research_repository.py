@@ -246,6 +246,11 @@ class ModelResearchRepository:
             walk_forward=walk_forward,
             incremental=bool(payload.get("incremental_from")),
         )
+        if execution['mode'] == 'distributed':
+            if model['kind'] == 'stacking' or payload.get('incremental_from'):
+                raise ModelResearchError('多节点训练暂不支持Stacking或增量续训')
+            if not (optuna.get('enabled') or walk_forward.get('enabled')):
+                raise ModelResearchError('多节点训练需要开启Optuna或独立滚动训练')
         spec_json = _canonical_json(spec)
         spec_hash = sha256(spec_json.encode("utf-8")).hexdigest()
         dataset_id = f"dataset_{spec_hash[:24]}"
@@ -1441,6 +1446,7 @@ class ModelResearchRepository:
         )
         if not bundle:
             raise ModelResearchConflict("模型缺少可下载的训练产物")
+        series = _inference_series_artifact(model.get('manifest_json') or {}, artifacts)
         job_id = f"model_job_{uuid4().hex}"
         title = str(
             payload.get("title")
@@ -1457,6 +1463,7 @@ class ModelResearchRepository:
                 "artifact_id": str(bundle["artifact_id"]),
                 "artifact_sha256": str(bundle["sha256"]),
                 "artifact_file_name": str(bundle["file_name"]),
+                **({'walk_forward_artifact': series} if series else {}),
             },
             "inference": {
                 "trade_date": trade_date,
@@ -1676,7 +1683,19 @@ class ModelResearchRepository:
             ).fetchone()
         if not row:
             raise ModelResearchNotFound("模型任务不存在")
-        return _job_row(row)
+        job = _job_row(row)
+        if (job.get('config_json') or {}).get('execution', {}).get('mode') == 'distributed':
+            from factor_service.training_subtask_repository import TrainingSubtaskRepository
+            tasks = TrainingSubtaskRepository(self.database).list(job_id)
+            # This payload also goes directly to the local worker/state store,
+            # without FastAPI's datetime encoder on a resumed dispatch.
+            job['subtasks'] = [_json_ready_mapping({key: task[key] for key in (
+                'task_key', 'kind', 'node_id', 'state', 'attempt_count', 'error',
+                'heartbeat_at', 'created_at', 'updated_at',
+            )}) for task in tasks]
+            for public, task in zip(job['subtasks'], tasks):
+                public['execution_observation'] = dict((task.get('result_json') or {}).get('execution_observation') or {})
+        return job
 
     def list_events(self, job_id: str, *, after: int = 0) -> list[dict[str, Any]]:
         self.get_job(job_id)
@@ -1746,7 +1765,7 @@ class ModelResearchRepository:
                     raise ModelResearchConflict("只有训练任务可以手动重试")
                 elif str(row.get("status") or "") != "failed":
                     raise ModelResearchConflict("只有失败且可重试的任务可以手动重试")
-                elif dict(result.get("failure") or {}).get("retryable") is not True:
+                elif not _failure_allows_manual_retry(result.get("failure"), error_message=row.get("error_message", "")):
                     raise ModelResearchConflict("任务失败原因不允许手动重试")
                 else:
                     result["manual_retry"] = {
@@ -2234,7 +2253,8 @@ class ModelResearchRepository:
                     """
                     UPDATE model_jobs
                     SET status = 'succeeded', result_json = %s, model_version = NULL,
-                        lease_expires_at = NULL, finished_at = %s, updated_at = %s
+                        lease_expires_at = NULL, finished_at = %s, updated_at = %s,
+                        progress_json = COALESCE(progress_json, '{}'::jsonb) || '{"stage":"succeeded","percent":100}'::jsonb
                     WHERE job_id = %s
                     """,
                     (Jsonb(stored_result), now, now, job_id),
@@ -6667,22 +6687,11 @@ def _model_spec(
 
 
 def _execution_spec(source: Mapping[str, Any]) -> dict[str, Any]:
-    node_id = str(source.get("node_id") or "local").strip()
-    if node_id != "local" and not re.fullmatch(
-        r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", node_id,
-    ):
-        raise ModelResearchError("execution.node_id无效")
+    from factor_service.research.distributed_config import execution_spec
     try:
-        max_runtime_minutes = int(source.get("max_runtime_minutes") or 720)
-    except (TypeError, ValueError) as exc:
-        raise ModelResearchError("execution.max_runtime_minutes必须是整数") from exc
-    if not 60 <= max_runtime_minutes <= 1440:
-        raise ModelResearchError("execution.max_runtime_minutes必须在60到1440之间")
-    return {
-        "node_id": node_id,
-        "mode": "local" if node_id == "local" else "remote_ssh_docker",
-        "max_runtime_minutes": max_runtime_minutes,
-    }
+        return execution_spec(dict(source))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ModelResearchError(str(exc)) from exc
 
 
 def _stacking_family(model_kinds: list[str]) -> str:
@@ -6917,8 +6926,46 @@ def _attempt_row(row: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _failure_allows_manual_retry(failure: Any, *, error_message: str = "") -> bool:
+    if not isinstance(failure, Mapping):
+        return False
+    if failure.get("retryable") is True:
+        return True
+    # Resource availability can change. Permit an explicit new attempt, while
+    # leaving automatic retry semantics and the old failure/audit untouched.
+    codes = {"node_memory_budget_exceeded", "node_out_of_memory", "node_ssh_error",
+             "node_ssh_authentication_failed", "node_ssh_connection_failed", "node_execution_unavailable"}
+    if (failure.get("error_code") or failure.get("code")) in codes:
+        return True
+    message = str(failure.get("message") or "")
+    from factor_service.research.errors import legacy_ssh_failure
+    # Older failure.message was truncated to 1000 characters before the real
+    # exception. The row's longer error_message can retain the exact SSH cause.
+    return (any(message.startswith(f"[{code}] ") for code in codes)
+            or legacy_ssh_failure(message) is not None
+            or legacy_ssh_failure(str(error_message)) is not None)
+
+
+def _inference_series_artifact(manifest, artifacts):
+    if (manifest.get('walk_forward') or {}).get('enabled') is not True:
+        return None  # A non-rolling model has no window series.
+    from factor_service.research.model_bundle import require_window_artifact
+    try:
+        reference = require_window_artifact(manifest)
+    except ValueError as exc:
+        raise ModelResearchConflict(str(exc)) from exc
+    series = next((a for a in artifacts if a.get('artifact_kind') == 'walk_forward_series'), None)
+    if (not series or reference.get('artifact_kind') != 'walk_forward_series'
+            or series.get('sha256') != reference.get('sha256')
+            or int(series.get('size_bytes') or 0) != int(reference.get('size_bytes') or 0)):
+        raise ModelResearchConflict('模型缺少与清单一致的滚动序列产物')
+    return {k: series[k] for k in ('artifact_id', 'sha256', 'size_bytes')}
+
+
 def _job_row(row: Mapping[str, Any]) -> dict[str, Any]:
     result = dict(row)
+    if result.get('status') == 'succeeded':
+        result['progress_json'] = {**dict(result.get('progress_json') or {}), 'stage': 'succeeded', 'percent': 100}
     result.pop("lease_token", None)
     # Repository rows are also the durable worker transport payload. psycopg
     # returns timestamp columns as datetime objects, which cannot be written to
@@ -6935,9 +6982,14 @@ def _job_row(row: Mapping[str, Any]) -> dict[str, Any]:
     result["retryable"] = (
         str(result.get("kind") or "train") == "train"
         and str(result.get("status") or "") == "failed"
-        and isinstance(failure, Mapping)
-        and failure.get("retryable") is True
+        and _failure_allows_manual_retry(failure, error_message=result.get("error_message", ""))
     )
+    if str(result.get("status") or "") == "failed":
+        from factor_service.research.errors import legacy_ssh_failure
+        legacy_error = legacy_ssh_failure(str(result.get("error_message") or ""))
+        if legacy_error is not None:
+            # Presentation only: retain original attempt logs and failure audit.
+            result["error_message"] = f"[{legacy_error.code}] {legacy_error}"
     if (
         str(result.get("kind") or "train") == "train"
         and str(result.get("status") or "") == "succeeded"

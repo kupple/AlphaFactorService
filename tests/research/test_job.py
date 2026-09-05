@@ -44,6 +44,16 @@ def test_job_validation_accepts_frozen_contract() -> None:
     assert job["dataset_spec"]["universe_id"] == "csi500"
 
 
+def test_job_validation_requires_parallel_work_for_multi_node():
+    from factor_service.research.distributed_config import execution_spec
+    source = valid_job()
+    source['config_json']['execution'] = execution_spec({'node_ids': ['cpu-a', 'cpu-b']})
+    with pytest.raises(PermanentJobError, match='需要开启Optuna'):
+        validate_job(source)
+    source['config_json']['optuna'] = {'enabled': True, 'n_trials': 10}
+    assert validate_job(source)['config_json']['execution']['node_ids'] == ['cpu-a', 'cpu-b']
+
+
 def test_job_validation_accepts_bounded_training_runtime() -> None:
     source = valid_job()
     source["config_json"]["execution"] = {

@@ -9,6 +9,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from typing import Any, Callable
@@ -23,7 +24,7 @@ from factor_service.research.autodl import (
 from factor_service.research.dataset import DatasetBuilder
 from factor_service.research.errors import (
     NodeMemoryBudgetExceeded, NodeOutOfMemory, NodeResourceUnavailable,
-    RetryableJobError,
+    RetryableJobError, NodeSSHError,
 )
 from factor_service.research.job import CancellationToken
 from factor_service.research.remote_node_repository import (
@@ -32,6 +33,7 @@ from factor_service.research.remote_node_repository import (
 from factor_service.research.remote_node_secrets import REMOTE_NODE_SECRET_KEY_ENV
 from factor_service.research.snapshot import DatasetSnapshotStore
 from factor_service.research.dataset_archive import archive_for_settings
+from factor_service.research.remote_cache import RemoteDatasetCache
 from factor_service.research.trainer import TrainingResult
 from factor_service.runtime_config import section
 
@@ -50,6 +52,19 @@ _REMOTE_VALIDATION_SAMPLE_ROWS = 200_000
 _REMOTE_TRAIN_METRIC_SAMPLE_ROWS = 200_000
 _REMOTE_POLL_RECOVERY_SECONDS = 90
 _REMOTE_POLL_RETRY_SECONDS = 2
+
+
+def _resource_probe_command(python: str) -> str:
+    # Probe with the exact lightweight reader used by the supervisor, including
+    # before a node has received its first source bundle. Never import ML here.
+    source = Path(__file__).with_name("runtime_resources.py").read_text(encoding="utf-8")
+    source += "\nr = read_runtime_resources()\n"
+    source += "if r.memory_limit_bytes <= 0: raise RuntimeError('无法读取节点真实内存限制')\n"
+    source += "print('cpu_cores=' + str(r.cpu_cores))\n"
+    source += "print('load=' + str(os.getloadavg()[0]))\n"
+    source += "print('mem=' + str(r.memory_limit_bytes // MIB) + ',' + str((r.memory_limit_bytes - r.memory_available_bytes) // MIB))\n"
+    source += "print('mem_cgroup=0,0')\n"
+    return f"{shlex.quote(python)} -c {shlex.quote(source)}"
 
 
 @dataclass(frozen=True)
@@ -211,18 +226,30 @@ class RemoteTransport:
         if node.authentication_type == "ssh_private_key" and node.ssh_private_key:
             self._materialize_private_key(node.ssh_private_key)
         self._ensure_client_tools()
+        # Short, private path stays below macOS's Unix socket path limit. Each
+        # transport owns its session: never share auth with another node/user.
+        self._control_directory = tempfile.TemporaryDirectory(prefix="abssh-", dir="/tmp")
+        self._control_path = Path(self._control_directory.name) / "control"
+        self._control_cleanup = weakref.finalize(
+            self, _close_control_session, self._control_path, self._target(),
+            self.node.port, self._control_directory.cleanup,
+        )
+
+    def close(self):
+        self._control_cleanup()
 
     def test_connection(self) -> dict[str, Any]:
         if self.node.runner == "direct_python":
             python = shlex.quote(self.node.python_executable)
             dependency_check = shlex.quote(
-                "import catboost, lightgbm, pandas, pyarrow, qlib, sklearn, torch, xgboost; "
+                "import catboost, lightgbm, optuna, pandas, pyarrow, qlib, sklearn, torch, xgboost; "
                 "print('python=ok'); print('torch=' + torch.__version__); "
                 "print('cuda=' + str(torch.cuda.is_available()).lower())"
             )
             command = (
                 "set -e; printf 'ssh=ok\\nrunner=direct_python\\n'; "
-                f"test -x {python}; {python} -c {dependency_check}; "
+                f"test -x {python}; {_resource_probe_command(self.node.python_executable)}; "
+                f"{python} -c {dependency_check}; "
                 "if command -v nvidia-smi >/dev/null 2>&1; then "
                 "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits; "
                 "else printf 'gpu=unavailable\\n'; fi"
@@ -247,13 +274,13 @@ class RemoteTransport:
 
     def collect_status(self) -> dict[str, Any]:
         runner_status = (
-            "printf '\\ncontainers='; pgrep -af '[f]actor_service.research.remote_runner' "
+            "printf '\\ncontainers='; ps -ax -o pid=,command= | grep '[f]actor_service.research.remote_runner' "
             "2>/dev/null | tr '\\n' ';'"
             if self.node.runner == "direct_python"
             else "printf '\\ncontainers='; docker ps --filter label=alphablocks.research=1 "
             "--format '{{.Names}}|{{.Status}}' 2>/dev/null | tr '\\n' ';'"
         )
-        command = (
+        resource_command = (
             "printf 'cpu_cores='; nproc 2>/dev/null || printf 0; "
             "printf '\\nload='; awk '{print $1}' /proc/loadavg 2>/dev/null || printf 0; "
             "printf '\\nmem='; free -m 2>/dev/null | awk '/^Mem:/{print $2\",\"$3}'; "
@@ -267,6 +294,10 @@ class RemoteTransport:
             "used=$(cat /sys/fs/cgroup/memory/memory.usage_in_bytes 2>/dev/null); "
             "printf '%s,%s' \"${limit:-0}\" \"${used:-0}\"; "
             "else printf '0,0'; fi; "
+        )
+        if self.node.runner == "direct_python":
+            resource_command = f"{_resource_probe_command(self.node.python_executable)}; "
+        command = "set -e; " + resource_command + (
             "printf '\\ndisk='; df -Pk / 2>/dev/null | awk 'NR==2{print $2\",\"$3}'; "
             "printf '\\ngpu='; if command -v nvidia-smi >/dev/null 2>&1; then "
             "nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu "
@@ -276,7 +307,8 @@ class RemoteTransport:
         try:
             completed = self.ssh(command, timeout=30)
         except Exception as exc:
-            return {**self.node.public(), "online": False, "error": str(exc)}
+            from factor_service.research.errors import error_payload
+            return {**self.node.public(), "online": False, "error": str(exc), **error_payload(exc)}
         if completed.returncode != 0:
             return {
                 **self.node.public(), "online": False,
@@ -326,10 +358,18 @@ class RemoteTransport:
         timeout: int,
         cancellation: CancellationToken | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        return self._run(
+        completed = self._run(
             [*self._auth_prefix(), *self._ssh_base(), command],
             timeout=timeout, cancellation=cancellation,
         )
+        self._check_ssh_failure(completed)
+        return completed
+
+    def _check_ssh_failure(self, completed):
+        from factor_service.research.errors import ssh_error_from_result
+        error = ssh_error_from_result(self.node.node_id, completed.returncode, completed.stderr)
+        if error is not None:
+            raise error
 
     def push(
         self,
@@ -338,6 +378,7 @@ class RemoteTransport:
         *,
         directory: bool = False,
         delete: bool = False,
+        checksum: bool = False,
         cancellation: CancellationToken | None = None,
     ) -> None:
         # macOS ships openrsync 2.6.9, which does not support the newer
@@ -349,12 +390,15 @@ class RemoteTransport:
         args = [*self._auth_prefix(), "rsync", "-a", "--partial"]
         if delete:
             args.append("--delete")
+        if checksum:
+            args.append("--checksum")
         if directory:
             args.extend(["--exclude", "__pycache__", "--exclude", "*.pyc"])
         args.extend(["-e", shlex.join(self._ssh_base(include_target=False))])
         local = str(source) + ("/" if directory else "")
         remote = f"{self._target()}:{remote_path}" + ("/" if directory else "")
         completed = self._run(args + [local, remote], timeout=3600, cancellation=cancellation)
+        self._check_ssh_failure(completed)
         if completed.returncode != 0:
             raise RetryableJobError(f"推送远程文件失败: {completed.stderr.strip()[-1000:]}")
 
@@ -374,6 +418,7 @@ class RemoteTransport:
         remote = f"{self._target()}:{remote_path}" + ("/" if directory else "")
         local = str(destination) + ("/" if directory else "")
         completed = self._run(args + [remote, local], timeout=3600, cancellation=cancellation)
+        self._check_ssh_failure(completed)
         if completed.returncode != 0:
             raise RetryableJobError(f"拉取远程产物失败: {completed.stderr.strip()[-1000:]}")
 
@@ -407,7 +452,8 @@ class RemoteTransport:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     process.terminate()
-                    raise TimeoutError(f"远程命令超时: {args[-1][:160]}")
+                    from factor_service.research.errors import NodeSSHConnectionError
+                    raise NodeSSHConnectionError(f"节点 {self.node.node_id} SSH命令或传输超时")
                 try:
                     # Short communicate calls drain both pipes while preserving
                     # cancellation checks for long-running SSH and rsync commands.
@@ -435,6 +481,8 @@ class RemoteTransport:
         args = [
             "ssh", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=15",
             "-o", "ServerAliveCountMax=3", "-p", str(self.node.port),
+            "-o", "ControlMaster=auto", "-o", "ControlPersist=60",
+            "-o", f"ControlPath={self._control_path}",
         ]
         if self.node.known_hosts is not None:
             args.extend([
@@ -444,9 +492,17 @@ class RemoteTransport:
         else:
             args.extend(["-o", "StrictHostKeyChecking=accept-new"])
         if self._ssh_key_path is not None:
-            args.extend(["-o", "BatchMode=yes", "-i", str(self._ssh_key_path)])
+            args.extend(["-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-i", str(self._ssh_key_path)])
         else:
             args.extend(["-o", "BatchMode=no"])
+            if self.node.ssh_password:
+                # Agent/default keys can exhaust sshd MaxAuthTries before
+                # sshpass receives a password prompt, including rsync's SSH.
+                args.extend([
+                    "-o", "PubkeyAuthentication=no",
+                    "-o", "PreferredAuthentications=password,keyboard-interactive",
+                    "-o", "NumberOfPasswordPrompts=1",
+                ])
         if include_target:
             args.append(self._target())
         return args
@@ -473,6 +529,22 @@ class RemoteTransport:
         self._ssh_key_cleanup = weakref.finalize(self, path.unlink, missing_ok=True)
 
 
+def _close_control_session(path, target, port, cleanup):
+    try:
+        if path.exists():
+            environment = os.environ.copy()
+            environment.pop(REMOTE_NODE_SECRET_KEY_ENV, None)
+            environment.pop("SSHPASS", None)
+            # -O exit is a local control-socket operation; it never logs in again.
+            subprocess.run(["ssh", "-S", str(path), "-O", "exit", "-p", str(port), target],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=3, check=False, env=environment)
+    except (OSError, subprocess.TimeoutExpired):
+        pass  # An idle orphan also expires via ControlPersist.
+    finally:
+        cleanup()
+
+
 class RemoteResearchExecutor:
     def __init__(self, settings: Settings, node: RemoteNode) -> None:
         self.settings = settings
@@ -491,6 +563,8 @@ class RemoteResearchExecutor:
         cancellation: CancellationToken,
         progress: Callable[[str, int, dict[str, Any]], None],
     ) -> TrainingResult:
+        self._remote_resource_details = {}
+        self._last_remote_training_progress = {'stage': 'training', 'percent': 63, 'details': {}}
         job_id = str(job["job_id"])
         attempt = max(1, int(job.get("attempt_count") or 1))
         remote_root = f"{self.node.work_dir}/runs/{job_id}/attempt-{attempt:03d}"
@@ -508,10 +582,22 @@ class RemoteResearchExecutor:
         })
         cancellation.checkpoint()
         remote_ready = False
+        runner_started = False
         lifecycle_attempted = False
+        cache_acquisition_attempted = False
+        dataset_cache_guard = RemoteDatasetCache(
+            self.node, self.transport, getattr(self.snapshot_store, "archive", None), job_id,
+        )
         try:
             lifecycle_attempted = self.lifecycle is not None
             self._prepare_lifecycle(cancellation=cancellation, progress=progress)
+            # AutoDL can update the resolved SSH endpoint during startup.
+            dataset_cache_guard.node = self.node
+            dataset_cache_guard.transport = self.transport
+            if getattr(self, "recoverable_cache_jobs", None):
+                dataset_cache_guard.recover_previous_jobs(self.recoverable_cache_jobs, cancellation)
+            cache_acquisition_attempted = True
+            dataset_cache_guard.acquire(cancellation)
             remote_ready = True
             progress("remote_preparing", 60, {"node_id": self.node.node_id})
             source_root = Path(__file__).resolve().parents[1]
@@ -537,7 +623,6 @@ class RemoteResearchExecutor:
                 json.dumps(job, ensure_ascii=False, sort_keys=True, default=str),
                 encoding="utf-8",
             )
-            dataset_dir = snapshot.dataset_path.parent
             source_cache_hit = self._remote_cache_ready(source_cache, cancellation)
             if not source_cache_hit:
                 self.transport.push(
@@ -545,13 +630,10 @@ class RemoteResearchExecutor:
                     directory=True, delete=True, cancellation=cancellation,
                 )
                 self._mark_remote_cache_ready(source_cache, cancellation)
-            dataset_cache_hit = self._remote_cache_ready(dataset_cache, cancellation)
-            if not dataset_cache_hit:
-                self.transport.push(
-                    dataset_dir, dataset_cache,
-                    directory=True, delete=True, cancellation=cancellation,
-                )
-                self._mark_remote_cache_ready(dataset_cache, cancellation)
+            dataset_cache_hit = dataset_cache_guard.prepare(
+                snapshot, str(job["dataset_hash"]),
+                cancellation=cancellation, progress=progress,
+            )
             links = (
                 f"rm -rf -- {shlex.quote(remote_root + '/source/factor_service')} "
                 f"{shlex.quote(remote_root + '/artifacts/datasets/' + str(job['dataset_hash']))}; "
@@ -639,6 +721,7 @@ class RemoteResearchExecutor:
                 command = "docker rm -f {name} >/dev/null 2>&1 || true; {run}".format(
                     name=shlex.quote(container), run=shlex.join(docker),
                 )
+            runner_started = True
             launched = self.transport.ssh(
                 command, timeout=120, cancellation=cancellation,
             )
@@ -679,9 +762,25 @@ class RemoteResearchExecutor:
                 )
             return result
         finally:
-            if remote_ready:
-                self._stop_remote_runner(container, remote_root)
-            if lifecycle_attempted:
+            ssh_failed = isinstance(sys.exc_info()[1], NodeSSHError)
+            if ssh_failed:
+                # The connection cannot prove remote ownership is idle. Do not
+                # hammer failed credentials, release the lock, or power it off.
+                try:
+                    progress("remote_cleanup_pending", 63, {"node_id": self.node.node_id,
+                             "job_id": job_id, "remote_root": remote_root,
+                             "message": "SSH不可用，保留缓存占用锁；节点恢复后需确认旧任务已结束"})
+                except Exception:
+                    pass  # Preserve the original typed SSH error.
+            else:
+                if runner_started:
+                    self._stop_remote_runner(container, remote_root)
+                dataset_cache_guard.release_when_idle()
+            # A failed lock acquisition must never shut down someone else's job.
+            if not ssh_failed and lifecycle_attempted and (
+                not cache_acquisition_attempted
+                or (remote_ready and not dataset_cache_guard.owned)
+            ):
                 self._power_off_after_job(job, progress)
 
     def _remote_cache_ready(
@@ -707,7 +806,7 @@ class RemoteResearchExecutor:
 
     def _remote_cpu_cores(self, cancellation: CancellationToken) -> int:
         completed = self.transport.ssh(
-            "nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || printf '4\\n'",
+            "nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || /usr/sbin/sysctl -n hw.logicalcpu 2>/dev/null || printf '4\\n'",
             timeout=30, cancellation=cancellation,
         )
         if completed.returncode != 0:
@@ -886,9 +985,16 @@ class RemoteResearchExecutor:
             f"{shlex.join(runner)}; code=$?; "
             f"printf '%s\\n' \"$code\" > {shlex.quote(paths['exit'])}; exit \"$code\""
         )
+        # macOS does not ship the Linux setsid executable. Python's POSIX setsid
+        # gives the shell wrapper the same dedicated, cancelable process group.
+        detach = shlex.join([
+            self.node.python_executable, "-c",
+            "import os, sys; os.setsid(); os.execv('/bin/sh', ['sh', '-c', sys.argv[1]])",
+            inner,
+        ])
         return (
             f"rm -f {shlex.quote(paths['exit'])} {shlex.quote(paths['pid'])}; "
-            f"nohup setsid sh -c {shlex.quote(inner)} > {shlex.quote(paths['log'])} 2>&1 < /dev/null & "
+            f"nohup {detach} > {shlex.quote(paths['log'])} 2>&1 < /dev/null & "
             f"printf '%s\\n' \"$!\" > {shlex.quote(paths['pid'])}"
         )
 

@@ -16,6 +16,7 @@ from factor_service.research.inference import (
     DailyInferenceRunner,
     _load_bundle,
     _load_model_for_trade_date,
+    _download_window_bundle,
 )
 from factor_service.research.industry_feature import (
     industry_feature_names,
@@ -115,7 +116,7 @@ def _training_manifest(
     }
 
 
-def test_rolling_bundle_routes_exact_trade_date_to_window_model(
+def test_independent_rolling_series_routes_exact_trade_date_to_window_model(
     tmp_path: Path,
 ) -> None:
     bundle_root = tmp_path / "bundle"
@@ -167,15 +168,31 @@ def test_rolling_bundle_routes_exact_trade_date_to_window_model(
         json.dumps(root_manifest), encoding="utf-8",
     )
     (bundle_root / "model.pkl").write_bytes(pickle.dumps({"root": True}))
+    source = {}
+    series = tmp_path / 'series.tar.gz'
+    with tarfile.open(series, 'w:gz') as archive:
+        archive.add(bundle_root / 'walk_forward', arcname='walk_forward')
+    root_manifest['walk_forward_artifact'] = {
+        'artifact_kind': 'walk_forward_series', 'sha256': sha256(series.read_bytes()).hexdigest(),
+        'size_bytes': series.stat().st_size,
+    }
+    (bundle_root / 'manifest.json').write_text(json.dumps(root_manifest))
+    source['walk_forward_artifact'] = {**root_manifest['walk_forward_artifact'], 'artifact_id': 'series'}
     bundle = tmp_path / "model.tar.gz"
     with tarfile.open(bundle, "w:gz") as archive:
         archive.add(bundle_root / "manifest.json", arcname="manifest.json")
         archive.add(bundle_root / "model.pkl", arcname="model.pkl")
-        archive.add(bundle_root / "walk_forward", arcname="walk_forward")
 
     root_model, loaded_manifest = _load_bundle(bundle)
+    class Control:
+        def download_artifact(self, artifact_id, destination, digest):
+            assert artifact_id == 'series' and digest == sha256(series.read_bytes()).hexdigest()
+            return series
+    window_bundle = _download_window_bundle(loaded_manifest, source, Control(), tmp_path)
+    with tarfile.open(bundle) as archive:
+        assert not any(n.startswith('walk_forward/') for n in archive.getnames())
     model, active_manifest, routing = _load_model_for_trade_date(
-        bundle, root_model, loaded_manifest, "2024-02-14",
+        window_bundle, root_model, loaded_manifest, "2024-02-14",
     )
 
     assert model == {"window": 2}

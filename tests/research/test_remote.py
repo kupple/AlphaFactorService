@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -154,6 +155,87 @@ def test_direct_python_runner_rejects_relative_python_path(tmp_path: Path) -> No
         load_remote_nodes(runtime)
 
 
+def test_password_transport_does_not_offer_unrelated_agent_keys(tmp_path, monkeypatch):
+    transport = RemoteTransport(load_remote_nodes(_runtime(tmp_path))[0])
+    captured = []
+
+    def fake_run(args, *, timeout, cancellation):
+        captured.append(args)
+        return subprocess.CompletedProcess(args, 0, "ok", "")
+
+    monkeypatch.setattr(transport, "_run", fake_run)
+    transport.ssh("true", timeout=30)
+    assert "PubkeyAuthentication=no" in captured[0]
+    assert "PreferredAuthentications=password,keyboard-interactive" in captured[0]
+    assert "NumberOfPasswordPrompts=1" in captured[0]
+    rsync_ssh = transport._ssh_base(include_target=False)
+    assert "PubkeyAuthentication=no" in rsync_ssh
+    assert "StrictHostKeyChecking=yes" in rsync_ssh
+    assert "private-value" not in " ".join(captured[0] + rsync_ssh)
+
+
+def test_control_sessions_are_private_scoped_and_explicitly_closed(tmp_path):
+    first = RemoteTransport(load_remote_nodes(_runtime(tmp_path))[0])
+    second = RemoteTransport(load_remote_nodes(_runtime(tmp_path))[0])
+    assert first._control_path != second._control_path
+    assert len(str(first._control_path).encode()) < 104
+    assert first._control_path.parent.stat().st_mode & 0o777 == 0o700
+    assert 'ControlMaster=auto' in first._ssh_base()
+    assert 'ControlPersist=60' in first._ssh_base()
+    assert f'ControlPath={first._control_path}' in first._ssh_base(include_target=False)
+    directory = first._control_path.parent
+    first.close()
+    first.close()  # Idempotent; must not open a connection on cleanup.
+    assert not directory.exists()
+    assert second._control_path.parent.exists()
+    second.close()
+
+
+def test_control_cleanup_uses_only_its_owned_local_socket(tmp_path, monkeypatch):
+    transport = RemoteTransport(load_remote_nodes(_runtime(tmp_path))[0])
+    transport._control_path.touch()
+    calls = []
+    monkeypatch.setattr('factor_service.research.remote.subprocess.run', lambda args, **kw: calls.append((args, kw)))
+    monkeypatch.setenv('ALPHA_REMOTE_NODE_SECRET_KEY', 'do-not-pass')
+    monkeypatch.setenv('SSHPASS', 'do-not-pass')
+    transport.close()
+    assert len(calls) == 1
+    assert calls[0][0][:5] == ['ssh', '-S', str(transport._control_path), '-O', 'exit']
+    assert 'ALPHA_REMOTE_NODE_SECRET_KEY' not in calls[0][1]['env']
+    assert 'SSHPASS' not in calls[0][1]['env']
+
+
+@pytest.mark.parametrize('operation', ['ssh', 'push', 'pull'])
+def test_authentication_failure_is_typed_in_all_transports(tmp_path, monkeypatch, operation):
+    from factor_service.research.errors import NodeSSHAuthenticationError
+    transport = RemoteTransport(load_remote_nodes(_runtime(tmp_path))[0])
+    calls = []
+    def run(args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 255, '', 'Too many authentication failures')
+    monkeypatch.setattr(transport, '_run', run)
+    with pytest.raises(NodeSSHAuthenticationError):
+        if operation == 'ssh':
+            transport.ssh('true', timeout=5)
+        elif operation == 'push':
+            transport.push(tmp_path / 'source', '/remote/destination')
+        else:
+            transport.pull('/remote/source', tmp_path / 'destination')
+    assert len(calls) == 1  # No repeated password attempts inside the transport.
+
+
+def test_status_keeps_ssh_error_code_for_scheduler(tmp_path, monkeypatch):
+    from factor_service.research.errors import NodeSSHAuthenticationError
+    transport = RemoteTransport(load_remote_nodes(_runtime(tmp_path))[0])
+    def fail(*a, **k):
+        raise NodeSSHAuthenticationError('node authentication failed')
+    monkeypatch.setattr(transport, 'ssh', fail)
+    status = transport.collect_status()
+    assert status['online'] is False
+    assert status['error_code'] == 'node_ssh_authentication_failed'
+    assert 'ssh_password' not in status
+
+
 def test_remote_transport_ssh_includes_target_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -179,6 +261,7 @@ def test_remote_transport_ssh_includes_target_once(
 
     assert captured.count("root@gpu.example.test") == 1
     assert captured[-1] == "printf ok"
+    assert "IdentitiesOnly=yes" in captured
     assert transport._ssh_key_path is not None
     assert transport._ssh_key_path.read_text(encoding="utf-8").startswith(
         "-----BEGIN OPENSSH PRIVATE KEY-----",
@@ -366,6 +449,51 @@ def test_remote_cpu_probe_prefers_affinity_aware_nproc():
     executor.transport = SimpleNamespace(ssh=ssh)
     assert executor._remote_cpu_cores(CancellationToken()) == 8
     assert commands[0].startswith("nproc ")
+    assert "sysctl -n hw.logicalcpu" in commands[0]
+
+
+def test_direct_node_status_uses_supervisor_resource_reader(tmp_path):
+    raw = _runtime(tmp_path)
+    raw["research"]["execution"]["remote_nodes"][0].update({
+        "runner": "direct_python", "python_executable": "/usr/bin/python3",
+    })
+    transport = object.__new__(RemoteTransport)
+    transport.node = load_remote_nodes(raw)[0]
+    commands = []
+    def ssh(command, **kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess([], 0, "cpu_cores=10\nload=1.5\nmem=16384,4096\nmem_cgroup=0,0\ndisk=1000,200\ngpu=unavailable\ncontainers=", "")
+    transport.ssh = ssh
+    result = transport.collect_status()
+    assert result["cpu_cores"] == 10
+    assert result["mem_total_mb"] == 16384
+    assert result["mem_used_mb"] == 4096
+    assert not result["training_active"]
+    assert "/usr/bin/vm_stat" in commands[0]
+    assert "ps -ax -o pid=,command=" in commands[0]
+
+
+def test_direct_python_launch_creates_owned_session_without_linux_setsid(tmp_path):
+    executor = object.__new__(RemoteResearchExecutor)
+    executor.node = SimpleNamespace(gpus="0", python_executable=sys.executable)
+    package = tmp_path / "source/factor_service/research"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    (package.parent / "__init__.py").write_text("")
+    (package / "remote_runner.py").write_text(
+        "import json, os, pathlib, sys\n"
+        "pathlib.Path(sys.argv[3]).write_text(json.dumps({'session': os.getsid(0), 'threads': os.environ['ALPHA_EFFECTIVE_NUM_THREADS']}))\n"
+    )
+    command = executor._direct_python_command(str(tmp_path), 2)
+    assert "nohup setsid" not in command
+    subprocess.run(command, shell=True, check=True, timeout=5, cwd=tmp_path)
+    deadline = time.monotonic() + 5
+    while not (tmp_path / "runner.exit").exists() and time.monotonic() < deadline:
+        time.sleep(.05)
+    assert (tmp_path / "runner.exit").read_text().strip() == "0"
+    result = json.loads((tmp_path / "remote_result.json").read_text())
+    assert result["session"] == int((tmp_path / "runner.pid").read_text())
+    assert result["threads"] == "2"
 
 
 def test_remote_poll_recovers_from_one_timeout(

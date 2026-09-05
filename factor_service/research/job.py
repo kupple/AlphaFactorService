@@ -472,15 +472,18 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
     execution = config.get("execution") or {"node_id": "local"}
     if not isinstance(execution, dict):
         raise PermanentJobError("execution必须是对象")
-    execution_node_id = _identifier(
-        execution.get("node_id") or "local", "execution.node_id",
-    )
-    execution_mode = str(execution.get("mode") or (
-        "local" if execution_node_id == "local" else "remote_ssh_docker"
-    ))
-    expected_mode = "local" if execution_node_id == "local" else "remote_ssh_docker"
-    if execution_mode != expected_mode:
+    from factor_service.research.distributed_config import execution_spec
+    try:
+        normalized_execution = execution_spec(execution)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise PermanentJobError(str(exc)) from exc
+    if execution.get("mode", normalized_execution["mode"]) != normalized_execution["mode"]:
         raise PermanentJobError("execution.mode与node_id不一致")
+    if normalized_execution["mode"] == "distributed":
+        if model_kind == "stacking" or config.get("incremental_training"):
+            raise PermanentJobError("多节点暂不支持Stacking或有前序依赖的增量续训")
+        if not (config.get("optuna") or {}).get("enabled") and not walk_forward.get("enabled"):
+            raise PermanentJobError("多节点训练需要开启Optuna或独立Walk-Forward")
     _integer(
         execution.get("max_runtime_minutes", 720),
         "execution.max_runtime_minutes",
@@ -935,6 +938,15 @@ def _validate_inference_config(config: dict[str, Any], *, model_id: str, version
     digest = str(source.get("artifact_sha256") or "").strip().lower()
     if not re.fullmatch(r"[0-9a-f]{64}", digest):
         raise PermanentJobError("每日推理模型产物SHA256无效")
+    series = source.get('walk_forward_artifact')
+    if series is not None:
+        if not isinstance(series, dict):
+            raise PermanentJobError('每日推理滚动序列产物无效')
+        _identifier(series.get('artifact_id'), 'walk_forward_artifact.artifact_id')
+        if not re.fullmatch(r'[0-9a-f]{64}', str(series.get('sha256') or '')):
+            raise PermanentJobError('每日推理滚动序列SHA256无效')
+        if not isinstance(series.get('size_bytes'), int) or series['size_bytes'] <= 0:
+            raise PermanentJobError('每日推理滚动序列大小无效')
     trade_date = _date(inference.get("trade_date"), "inference.trade_date")
     cutoff = _datetime(inference.get("data_cutoff"), "inference.data_cutoff")
     feature_cutoff = _datetime(inference.get("feature_cutoff_at"), "inference.feature_cutoff_at")

@@ -201,7 +201,8 @@ class DatasetPreviewService:
             work_dir = Path(settings.work_root) / preview_id
             archive = archive_for_settings(settings)
             snapshot_store = DatasetSnapshotStore(settings.model_artifacts_root, archive=archive)
-            usage = snapshot_store.artifacts.dataset_usage(str(job["dataset_hash"]))
+            usage = (archive.cache_slot(str(job["dataset_hash"])) if archive is not None
+                     else snapshot_store.artifacts.dataset_usage(str(job["dataset_hash"])))
             usage.__enter__()
             snapshot = snapshot_store.get_or_create(
                 job,
@@ -263,8 +264,6 @@ class DatasetPreviewService:
         finally:
             if usage is not None:
                 usage.__exit__(None, None, None)
-            if archive is not None:
-                archive.try_evict(str(job["dataset_hash"]))
 
     def get(self, preview_id: str) -> dict[str, Any]:
         return _preview_view(self._preview_job(preview_id))

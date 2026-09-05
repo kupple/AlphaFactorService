@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import nullcontext
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -48,7 +49,8 @@ class DatasetSnapshotStore:
         manifest_path = canonical_dir / "dataset_manifest.json"
         _checkpoint(cancellation)
         _progress(progress, "checking_dataset_snapshot", 4, {"dataset_hash": dataset_hash})
-        with self.artifacts.dataset_lock(dataset_hash):
+        slot = self.archive.cache_slot(dataset_hash) if self.archive is not None else nullcontext()
+        with slot, self.artifacts.dataset_lock(dataset_hash):
             if self.archive is not None:
                 self.archive.restore_locked(
                     dataset_hash, checkpoint=lambda: _checkpoint(cancellation),
@@ -122,11 +124,13 @@ class DatasetSnapshotStore:
             # immutable artifact, never the in-memory frame used to create it.
             loaded = self._load(dataset_hash, dataset_path, raw_dataset_path, manifest_path)
             self.artifacts.touch_dataset(dataset_hash)
-            self._archive(job, cancellation, progress)
             try:
                 shutil.rmtree(staging_dir)
             except OSError:
                 pass
+            # The canonical copy is verified above. Keep it (not a second staging
+            # copy) if MinIO upload or PostgreSQL registration subsequently fails.
+            self._archive(job, cancellation, progress)
             return DatasetSnapshot(loaded, dataset_path, raw_dataset_path, manifest_path, False)
 
     def _archive(self, job: dict, cancellation: Any, progress: Any) -> None:

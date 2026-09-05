@@ -28,6 +28,7 @@ from factor_service.research.preprocessing import (
     preprocess_feature_panel,
 )
 from factor_service.research.rolling import effective_rolling_window
+from factor_service.research.model_bundle import require_window_artifact
 from factor_service.research.size_rotation_feature import (
     normalize_size_rotation_feature,
     size_rotation_feature_names,
@@ -78,8 +79,13 @@ class DailyInferenceRunner:
         )
         _checkpoint(cancellation)
         root_model, training_manifest = _load_bundle(bundle_path)
+        window_bundle_path = None
+        if (training_manifest.get('walk_forward') or {}).get('enabled') is True:
+            window_bundle_path = _download_window_bundle(
+                training_manifest, source, self.control, work_dir,
+            )
         model, training_manifest, rolling_model = _load_model_for_trade_date(
-            bundle_path,
+            window_bundle_path,
             root_model,
             training_manifest,
             trade_date,
@@ -608,6 +614,9 @@ def _predict_stacking(
 def _load_bundle(path: Path) -> tuple[Any, dict[str, Any]]:
     payloads: dict[str, bytes] = {}
     with tarfile.open(path, "r:gz") as archive:
+        if any(member.name == 'walk_forward' or member.name.startswith('walk_forward/')
+               for member in archive.getmembers()):
+            raise PermanentJobError('主模型包不允许内嵌滚动窗口，必须使用独立序列包')
         for required in ("model.pkl", "manifest.json"):
             member = archive.getmember(required)
             if not member.isfile() or member.size <= 0 or member.size > 256 * 1024 * 1024:
@@ -617,17 +626,42 @@ def _load_bundle(path: Path) -> tuple[Any, dict[str, Any]]:
                 raise PermanentJobError(f"无法读取模型产物中的{required}")
             payloads[required] = source.read()
     try:
-        model = pickle.loads(payloads["model.pkl"])
         manifest = json.loads(payloads["manifest.json"].decode("utf-8"))
     except Exception as exc:
         raise PermanentJobError(f"模型产物解析失败: {exc}") from exc
     if not isinstance(manifest, dict):
         raise PermanentJobError("训练manifest必须是JSON对象")
+    if (manifest.get('walk_forward') or {}).get('enabled') is True:
+        try:
+            require_window_artifact(manifest)
+        except ValueError as exc:
+            raise PermanentJobError(str(exc)) from exc
+    try:
+        model = pickle.loads(payloads['model.pkl'])
+    except Exception as exc:
+        raise PermanentJobError(f'模型产物解析失败: {exc}') from exc
     return model, manifest
 
 
+def _download_window_bundle(manifest, source, control, work_dir):
+    try:
+        reference = require_window_artifact(manifest)
+    except ValueError as exc:
+        raise PermanentJobError(str(exc)) from exc
+    frozen = source.get('walk_forward_artifact') or {}
+    if (reference.get('artifact_kind') != 'walk_forward_series'
+            or not frozen.get('artifact_id')
+            or frozen.get('sha256') != reference.get('sha256')
+            or int(frozen.get('size_bytes') or 0) != int(reference.get('size_bytes') or 0)):
+        raise PermanentJobError('滚动序列产物与冻结模型清单不一致')
+    path = control.download_artifact(frozen['artifact_id'], work_dir / 'source_windows.tar.gz', frozen['sha256'])
+    if path.stat().st_size != int(reference['size_bytes']):
+        raise PermanentJobError('滚动序列产物大小与清单不一致')
+    return path
+
+
 def _load_model_for_trade_date(
-    path: Path,
+    series_path: Path | None,
     root_model: Any,
     root_manifest: dict[str, Any],
     trade_date: str,
@@ -642,6 +676,12 @@ def _load_model_for_trade_date(
         raise PermanentJobError(str(exc)) from exc
     if selected is None:
         return root_model, root_manifest, None
+    try:
+        require_window_artifact(root_manifest)
+    except ValueError as exc:
+        raise PermanentJobError(str(exc)) from exc
+    if series_path is None:
+        raise PermanentJobError('滚动模型缺少独立序列包')
 
     artifact = dict(selected.get("artifact") or {})
     relative_root = str(artifact.get("path") or "").strip("/")
@@ -650,13 +690,13 @@ def _load_model_for_trade_date(
     model_member = f"{relative_root}/model.pkl"
     manifest_member = f"{relative_root}/manifest.json"
     payloads: dict[str, bytes] = {}
-    with tarfile.open(path, "r:gz") as archive:
+    with tarfile.open(series_path, "r:gz") as archive:
         for member_name in (model_member, manifest_member):
             try:
                 member = archive.getmember(member_name)
             except KeyError as exc:
                 raise PermanentJobError(
-                    f"训练Bundle缺少滚动窗口产物{member_name}"
+                    f"独立序列包缺少滚动窗口产物{member_name}"
                 ) from exc
             if (
                 not member.isfile()

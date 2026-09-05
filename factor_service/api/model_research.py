@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from factor_service import model_repository
 from factor_service.config import load_settings as load_service_settings
 from factor_service.model_artifacts import ArtifactError, ModelArtifactStore
-from factor_service.research.dataset_archive import dataset_files, DATASET_FILES
+from factor_service.research.dataset_archive import dataset_files, DATASET_FILES, DatasetCacheBusy
 from factor_service.model_backtest import run_model_backtest_job
 from factor_service.model_diagnostics import (
     architecture_walk_forward_attribution,
@@ -49,6 +49,7 @@ from factor_service.model_research_repository import (
     ModelResearchError,
     ModelResearchNotFound,
     ModelResearchRepository,
+    _execution_spec,
 )
 from factor_service.research.worker import ResearchWorker
 from factor_service.research.schedule import dispatch_job as dispatch_model_job
@@ -89,7 +90,7 @@ def _worker(request: Request) -> ResearchWorker:
 def _raise(exc: Exception) -> None:
     if isinstance(exc, ModelResearchNotFound):
         status = HTTPStatus.NOT_FOUND
-    elif isinstance(exc, ModelResearchConflict):
+    elif isinstance(exc, (ModelResearchConflict, DatasetCacheBusy)):
         status = HTTPStatus.CONFLICT
     elif isinstance(exc, (ArtifactError, FileNotFoundError)):
         status = HTTPStatus.NOT_FOUND
@@ -291,29 +292,19 @@ def _assert_model_active(model: dict[str, Any], action: str) -> None:
 
 
 def _validate_execution_node(payload: dict[str, Any]) -> None:
-    execution = payload.get("execution") or {}
-    node_id = str(
-        (execution.get("node_id") if isinstance(execution, dict) else "")
-        or payload.get("execution_node_id")
-        or "local"
-    ).strip()
-    if node_id == "local":
-        return
+    execution = _execution_spec(payload.get("execution") or {
+        "node_id": payload.get("execution_node_id") or "local",
+    })
     from factor_service.research.remote import get_remote_node
 
-    node = get_remote_node(node_id)
-    try:
-        requested_minutes = int(
-            execution.get("max_runtime_minutes") or 720
-        ) if isinstance(execution, dict) else 720
-    except (TypeError, ValueError) as exc:
-        raise ModelResearchError(
-            "execution.max_runtime_minutes必须是整数"
-        ) from exc
-    if requested_minutes > int(node.max_runtime_minutes):
-        raise ModelResearchConflict(
-            f"训练节点“{node.name}”单次任务最长{node.max_runtime_minutes}分钟"
-        )
+    for node_id in execution.get("node_ids", [execution["node_id"]]):
+        if node_id == "local":
+            continue
+        node = get_remote_node(node_id)
+        if execution["max_runtime_minutes"] > int(node.max_runtime_minutes):
+            raise ModelResearchConflict(
+                f"训练节点“{node.name}”单次任务最长{node.max_runtime_minutes}分钟"
+            )
 
 
 def _freeze_training_data_bindings(payload: dict[str, Any]) -> None:

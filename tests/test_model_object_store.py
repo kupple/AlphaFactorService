@@ -17,6 +17,38 @@ from factor_service.model_object_store import (
 )
 
 
+def test_upload_progress_reports_bytes_and_reuses_identical_object(tmp_path):
+    source = tmp_path / 'model.tar.gz'
+    source.write_bytes(b'archive-body')
+    client = _MemoryMinio()
+    store = ModelObjectStore(_config(), client=client)
+    events = []
+    params = dict(job_id='job', model_id='model', model_version=1, artifact_kind='bundle',
+                  source_path=source, digest=sha256(source.read_bytes()).hexdigest(), size_bytes=source.stat().st_size,
+                  progress=lambda done, total: events.append((done, total)))
+    store.publish_file(**params)
+    assert events[0] == (0, source.stat().st_size)
+    assert events[-1] == (source.stat().st_size, source.stat().st_size)
+    assert [e[0] for e in events] == sorted(e[0] for e in events)
+    store.publish_file(**params)
+    assert len(client.uploads) == 1
+
+
+def test_upload_checkpoint_cancellation_is_not_swallowed(tmp_path):
+    from factor_service.research.errors import JobCanceled
+    source = tmp_path / 'model.tar.gz'
+    source.write_bytes(b'archive-body')
+    client = _MemoryMinio()
+    store = ModelObjectStore(_config(), client=client)
+    def checkpoint():
+        raise JobCanceled('cancel upload')
+    with pytest.raises(JobCanceled):
+        store.publish_file(job_id='job', model_id='model', model_version=1, artifact_kind='bundle',
+                           source_path=source, digest=sha256(source.read_bytes()).hexdigest(),
+                           size_bytes=source.stat().st_size, checkpoint=checkpoint)
+    assert not client.uploads
+
+
 class _MemoryMinio:
     def __init__(self) -> None:
         self.objects: dict[tuple[str, str], SimpleNamespace] = {}

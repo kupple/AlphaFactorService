@@ -1,15 +1,18 @@
 from __future__ import annotations
 
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
+import fcntl
 from hashlib import sha256
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any, Iterator
 
 from factor_service.dataset_archive_repository import DatasetArchiveRepository
 from factor_service.model_artifacts import ArtifactError, ModelArtifactStore
 from factor_service.model_object_store import ModelObjectStore
+from factor_service.research.errors import RetryableJobError
 
 
 DATASET_FILES = {
@@ -18,6 +21,12 @@ DATASET_FILES = {
     "dataset_manifest.json": "dataset_manifest",
 }
 logger = logging.getLogger(__name__)
+
+
+class DatasetCacheBusy(RetryableJobError):
+    """A different snapshot still has live users; retry after they release it."""
+
+    code = "dataset_cache_busy"
 
 
 def file_sha256(path: Path) -> str:
@@ -29,7 +38,7 @@ def file_sha256(path: Path) -> str:
 
 
 class DatasetArchive:
-    """MinIO owns bytes, PostgreSQL owns identity, disk is a pinned scratch cache."""
+    """MinIO owns bytes; disk retains one pinned, replaceable dataset snapshot."""
 
     def __init__(self, artifacts: ModelArtifactStore, objects: ModelObjectStore,
                  repository: Any = None, active_hashes: Any = None) -> None:
@@ -60,6 +69,88 @@ class DatasetArchive:
             if row.get("dataset_hash") != dataset_hash:
                 raise ArtifactError("数据库中的数据集归档身份不一致")
         return row
+
+    @contextmanager
+    def _cache_lock(self) -> Iterator[None]:
+        path = self.artifacts.root / ".dataset-cache-slot.lock"
+        descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, "a+b") as stream:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            yield
+
+    def _cache_directories(self) -> list[Path]:
+        root = self.artifacts.root / "datasets"
+        if root.is_symlink() or root.resolve() != root:
+            raise ArtifactError("数据集缓存路径不能是符号链接")
+        entries = sorted(root.iterdir()) if root.exists() else []
+        for path in entries:
+            self.artifacts._dataset_hash(path.name)
+            if path.is_symlink() or not path.is_dir():
+                raise ArtifactError("数据集缓存含未知路径，已保留")
+        return entries
+
+    def _eviction_files(self, dataset_hash: str) -> list[Path] | None:
+        """Caller holds both usage-exclusive and publication locks."""
+        directory = self.directory(dataset_hash)
+        paths = list(directory.iterdir())
+        if not paths:
+            return []  # An abandoned reservation contains no data to recover.
+        allowed = {*DATASET_FILES, ".last_used"}
+        if any(p.is_symlink() or not p.is_file() or p.name not in allowed for p in paths):
+            raise ArtifactError("数据集缓存包含未知文件，保留本地副本")
+        record = self.record(dataset_hash)
+        if record is None:
+            return None
+        for name, identity in record["files_json"].items():
+            self.objects.verify_file(identity)
+            path = directory / name
+            if path.exists():
+                self._verify_local(path, identity)
+        return paths
+
+    def _replace_others(self, target: str, *, protected_hashes: set[str] | frozenset[str] = frozenset()) -> dict:
+        """Under cache lock, validate/lock ALL old copies before deleting ANY."""
+        obsolete = [p for p in self._cache_directories() if p.name != target]
+        result = {"deleted": [], "reclaimed_bytes": 0}
+        with ExitStack() as locks:
+            prepared = []
+            for directory in obsolete:
+                key = directory.name
+                if key in protected_hashes:
+                    raise DatasetCacheBusy("旧数据集仍被活动任务保护，暂不清理缓存")
+                try:
+                    locks.enter_context(self.artifacts.dataset_usage(key, exclusive=True, blocking=False))
+                    locks.enter_context(self.artifacts.dataset_lock(key, blocking=False))
+                except BlockingIOError as exc:
+                    raise DatasetCacheBusy("另一份数据集正在生成、训练或读取，请稍后重试；本地缓存最多保留一份") from exc
+                paths = self._eviction_files(key)
+                if paths is None:
+                    raise ArtifactError(f"旧数据集{key}尚未归档MinIO，已保留；请先完成归档再切换数据集")
+                prepared.append((directory, paths))
+            for directory, paths in prepared:
+                result["reclaimed_bytes"] += sum(p.stat().st_size for p in paths)
+                for path in paths:
+                    path.unlink()
+                directory.rmdir()
+                result["deleted"].append(directory.name)
+        return result
+
+    @contextmanager
+    def cache_slot(self, dataset_hash: str) -> Iterator[Path]:
+        """Reserve the only cache slot before building/hydrating; retain on exit.
+
+        Shared dataset pins allow concurrent users of the SAME snapshot. Another
+        hash cannot enter until all current readers/builders have released theirs.
+        Queued tasks alone do not pin disk; they can hydrate later from MinIO.
+        """
+        clean = self.artifacts._dataset_hash(dataset_hash)
+        with ExitStack() as usage:
+            with self._cache_lock():
+                self._replace_others(clean)
+                directory = self.directory(clean)
+                directory.mkdir(parents=True, exist_ok=True)
+                usage.enter_context(self.artifacts.dataset_usage(clean))
+            yield directory
 
     def restore_locked(self, dataset_hash: str, *, checkpoint: Any = None) -> bool:
         """Caller holds publication lock. A broken archive never triggers rebuild."""
@@ -136,38 +227,25 @@ class DatasetArchive:
 
     @contextmanager
     def use(self, dataset_hash: str) -> Iterator[Path]:
-        """Hydrate for diagnostics/downloads and evict after the last consumer exits."""
-        try:
-            with self.artifacts.dataset_usage(dataset_hash):
-                with self.artifacts.dataset_lock(dataset_hash):
-                    self.restore_locked(dataset_hash)
-                yield self.directory(dataset_hash)
-        finally:
-            self.try_evict(dataset_hash)
+        """Hydrate/pin for the reader's lifetime; retain this most recent snapshot."""
+        with self.cache_slot(dataset_hash) as directory:
+            with self.artifacts.dataset_lock(dataset_hash):
+                self.restore_locked(dataset_hash)
+            yield directory
 
     def evict(self, dataset_hash: str, *, protected_hashes: set[str] | None = None) -> int:
         protected = self.active_hashes() if protected_hashes is None else protected_hashes
         if dataset_hash in protected:
             return 0
         try:
-            with self.artifacts.dataset_usage(dataset_hash, exclusive=True, blocking=False):
+            with self._cache_lock(), self.artifacts.dataset_usage(dataset_hash, exclusive=True, blocking=False):
                 with self.artifacts.dataset_lock(dataset_hash, blocking=False):
                     directory = self.directory(dataset_hash)
                     if not directory.is_dir():
                         return 0
-                    record = self.record(dataset_hash)
-                    if record is None:
+                    paths = self._eviction_files(dataset_hash)
+                    if paths is None:
                         return 0  # Never evict an unarchived / failed-upload dataset.
-                    paths = list(directory.iterdir())
-                    allowed = {*DATASET_FILES, ".last_used"}
-                    if any(p.is_symlink() or not p.is_file() or p.name not in allowed for p in paths):
-                        raise ArtifactError("数据集缓存包含未知文件，保留本地副本")
-                    # Validate every object BEFORE deleting even one local file.
-                    for name, identity in record["files_json"].items():
-                        self.objects.verify_file(identity)
-                        path = directory / name
-                        if path.exists():
-                            self._verify_local(path, identity)
                     size = sum(p.stat().st_size for p in paths)
                     for path in paths:
                         path.unlink()
@@ -185,20 +263,18 @@ class DatasetArchive:
 
     def cleanup(self, *, protected_hashes: set[str] | None = None) -> dict:
         protected = self.active_hashes() if protected_hashes is None else protected_hashes
-        root = self.artifacts.root / "datasets"
-        result = {"scanned": 0, "deleted": [], "reclaimed_bytes": 0, "errors": []}
-        for path in sorted(root.iterdir()) if root.is_dir() else []:
-            if path.is_symlink() or not path.is_dir():
-                continue
-            try:
-                clean = self.artifacts._dataset_hash(path.name)
-                result["scanned"] += 1
-                size = self.evict(clean, protected_hashes=protected)
-                if size:
-                    result["deleted"].append(clean)
-                    result["reclaimed_bytes"] += size
-            except Exception as exc:
-                result["errors"].append({"dataset_hash": path.name, "error": str(exc)})
+        result = {"scanned": 0, "deleted": [], "reclaimed_bytes": 0, "errors": [], "capacity": 1, "retained": ""}
+        try:
+            with self._cache_lock():
+                directories = self._cache_directories()
+                result["scanned"] = len(directories)
+                if directories:
+                    latest = max(directories, key=lambda p: (p / ".last_used").stat().st_mtime
+                                 if (p / ".last_used").is_file() else p.stat().st_mtime)
+                    result["retained"] = latest.name
+                    result.update(self._replace_others(latest.name, protected_hashes=protected))
+        except Exception as exc:
+            result["errors"].append({"error": str(exc)})
         return result
 
     @staticmethod
@@ -241,12 +317,16 @@ def archive_existing_job_dataset(job_id: str, *, evict: bool = False,
         raise ArtifactError("请先启用MinIO存储")
     job = ModelResearchRepository().get_job(job_id)
     dataset_hash = str(job['dataset_hash'])
+    # Maintenance must be able to archive legacy unarchived copies one by one.
+    # A shared pin protects existing files without admitting an additional copy;
+    # only hydration of missing files requires the single-slot reservation.
     with archive.artifacts.dataset_usage(dataset_hash):
-        with archive.artifacts.dataset_lock(dataset_hash):
-            if not (archive.directory(dataset_hash) / 'dataset_manifest.json').is_file():
-                if not archive.restore_locked(dataset_hash):
+        existing = (archive.directory(dataset_hash) / 'dataset_manifest.json').is_file()
+        with nullcontext() if existing else archive.cache_slot(dataset_hash):
+            with archive.artifacts.dataset_lock(dataset_hash):
+                if not existing and not archive.restore_locked(dataset_hash):
                     raise ArtifactError("本地和MinIO都没有该数据集；不会自动重新计算")
-            record = archive.archive_locked(dataset_hash, spec=dict(job.get('dataset_spec') or {}))
+                record = archive.archive_locked(dataset_hash, spec=dict(job.get('dataset_spec') or {}))
     result = {'job_id': job_id, 'dataset_hash': dataset_hash, 'files': record['files_json']}
     if evict:
         result['reclaimed_bytes'] = archive.evict(dataset_hash)
@@ -256,6 +336,7 @@ def archive_existing_job_dataset(job_id: str, *, evict: bool = False,
         with archive.use(dataset_hash):
             result['restored_and_verified'] = True
         result['temporary_files_removed'] = not archive.directory(dataset_hash).exists()
+        result['cache_retained'] = archive.directory(dataset_hash).exists()
     return result
 
 

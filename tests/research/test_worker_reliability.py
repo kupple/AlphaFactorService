@@ -13,6 +13,28 @@ from factor_service.research.worker import ResearchWorker
 from tests.research.utils import valid_job
 
 
+@pytest.mark.parametrize('code,retryable,error_name', [
+    ('retryable_error', True, 'RetryableJobError'),
+    ('canceled', False, 'JobCanceled'),
+    ('node_memory_budget_exceeded', False, 'NodeMemoryBudgetExceeded'),
+    ('training_timeout', False, 'TrainingTimeout'),
+    ('permanent_error', False, 'PermanentJobError'),
+    ('node_ssh_authentication_failed', False, 'NodeSSHAuthenticationError'),
+    ('node_ssh_connection_failed', False, 'NodeSSHConnectionError'),
+    ('node_execution_unavailable', False, 'NodeExecutionUnavailable'),
+])
+def test_isolated_runner_preserves_error_semantics(tmp_path, monkeypatch, code, retryable, error_name):
+    import json
+    from factor_service.research import errors
+    def spawn(command, **kwargs):
+        Path(command[-1]).write_text(json.dumps(dict(error='synthetic failure', error_code=code, retryable=retryable)))
+        return SimpleNamespace(returncode=1, poll=lambda: 1)
+    monkeypatch.setattr('factor_service.research.worker.subprocess.Popen', spawn)
+    worker = ResearchWorker.__new__(ResearchWorker)
+    with pytest.raises(getattr(errors, error_name), match='synthetic failure'):
+        worker._run_isolated_model(valid_job(), tmp_path, CancellationToken())
+
+
 def _settings(tmp_path: Path):
     return SimpleNamespace(
         work_root=tmp_path,

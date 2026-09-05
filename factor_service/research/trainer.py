@@ -33,6 +33,7 @@ from factor_service.research.preprocessing import (
 )
 from factor_service.research.snapshot import DatasetSnapshotStore
 from factor_service.research.dataset_archive import archive_for_settings
+from factor_service.research.model_bundle import package_model_bundle
 from factor_service.research.runtime_resources import release_training_memory
 from factor_service.research.training_diagnostics import build_training_diagnostics
 
@@ -95,8 +96,34 @@ class QlibTrainer:
         self.snapshot_store = DatasetSnapshotStore(
             settings.model_artifacts_root, archive=archive_for_settings(settings),
         )
+        self.distributed = None
 
     def train(
+        self,
+        job: dict[str, Any],
+        work_dir: Path,
+        *,
+        cancellation: CancellationToken | None = None,
+        progress: ProgressCallback | None = None,
+    ) -> TrainingResult:
+        # The isolated trainer must own its pin too: a parent worker exiting must
+        # not allow another task to replace files still needed by this process.
+        archive = self.snapshot_store.archive
+        usage = (archive.cache_slot(str(job["dataset_hash"])) if archive is not None
+                 else self.snapshot_store.artifacts.dataset_usage(str(job["dataset_hash"])))
+        with usage:
+            from factor_service.research.distributed_config import distributed_nodes
+            if distributed_nodes(job):
+                from factor_service.research.distributed import DistributedTraining
+                with DistributedTraining(self.settings, job, work_dir, cancellation, progress) as execution:
+                    self.distributed = execution
+                    try:
+                        return self._train(job, work_dir, cancellation=execution.cancellation, progress=progress)
+                    finally:
+                        self.distributed = None
+            return self._train(job, work_dir, cancellation=cancellation, progress=progress)
+
+    def _train(
         self,
         job: dict[str, Any],
         work_dir: Path,
@@ -120,8 +147,11 @@ class QlibTrainer:
             job, work_dir, None, builder_factory=create_builder,
             cancellation=cancellation, progress=progress,
         )
+        if self.distributed is not None:
+            self.distributed.bind_snapshot(snapshot, self.snapshot_store)
         prepared = snapshot.prepared
         config = dict(job.get("config_json") or {})
+        subtask = dict(config.get("_distributed_task") or {})
         dataset_spec = dict(job.get("dataset_spec") or config.get("dataset") or {})
         label_spec = dict(dataset_spec.get("label") or {})
         target_mode = str(
@@ -182,7 +212,7 @@ class QlibTrainer:
         recorder_uri = f"sqlite:///{recorder_db.as_posix()}"
         experiment_name = f"alphablocks_{job['model_id']}"
         _prepare_recorder_experiment(recorder_uri, experiment_name, recorder_root)
-        optuna_result: dict[str, Any] | None = None
+        optuna_result: dict[str, Any] | None = subtask.get("optuna_result")
         optuna_config = dict(config.get("optuna") or {})
         if optuna_config.get("enabled") is True:
             tuning_experiment_name = (
@@ -208,8 +238,20 @@ class QlibTrainer:
                     classification=classification,
                     cancellation=cancellation,
                     progress=progress,
+                    distributed=self.distributed,
+                    fixed_trial=subtask if subtask.get("kind") == "optuna_trial" else None,
                 )
+            if subtask.get("kind") == "optuna_trial":
+                optuna_result.setdefault('attrs', {})['environment'] = {
+                    'python': platform.python_version(), 'platform': platform.platform(),
+                    'qlib': getattr(qlib, '__version__', 'unknown'), **_model_package_version(model_kind),
+                }
+                trial_path = work_dir / "trial_result.json"
+                trial_path.write_text(json.dumps(optuna_result, ensure_ascii=False), encoding="utf-8")
+                return TrainingResult({"trial": optuna_result}, [("trial_result", trial_path)], trial_path)
             raw_params = {**raw_params, **dict(optuna_result["best_params"])}
+        if self.distributed is not None and walk_forward_config.get("enabled") is not True:
+            return self.distributed.final_model(raw_params, optuna_result)
         if model_kind != "stacking" and walk_forward_config.get("enabled") is not True:
             handler = DataHandlerLP.from_df(training_prepared.frame)
             dataset = _dataset_for_model(
@@ -244,7 +286,11 @@ class QlibTrainer:
                 experiment_name=rolling_experiment_name,
                 cancellation=cancellation,
                 progress=progress,
+                distributed=self.distributed,
+                only_window=int(subtask["window"]) if subtask.get("kind") == "window" else None,
             )
+            if subtask.get("kind") == "window":
+                return walk_forward_result
             walk_forward_prediction = walk_forward_result.prediction
             walk_forward_report = walk_forward_result.report
             model = walk_forward_result.latest_model
@@ -451,7 +497,7 @@ class QlibTrainer:
             "research_target": research_target,
             "prediction_scope": prediction_scope,
             "target_mode": target_mode,
-            "execution": dict(config.get("execution") or {"node_id": "local", "mode": "local"}),
+            "execution": dict(subtask.get("parent_execution") or config.get("execution") or {"node_id": "local", "mode": "local"}),
             "model_version": int((job.get("config_json") or {}).get("planned_model_version") or 1),
             "qlib_recorder_id": recorder_id,
             "qlib_recorder_uri": recorder_uri,
@@ -520,7 +566,7 @@ class QlibTrainer:
         optuna_path = work_dir / "optuna_trials.json"
         config_path = work_dir / "task_config.json"
         model_path = work_dir / "model.pkl"
-        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        _progress(progress, "packaging", 85, {})
         metrics_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
         importance_path.write_text(json.dumps(feature_importance, ensure_ascii=False, indent=2), encoding="utf-8")
         training_diagnostics_path.write_text(
@@ -534,23 +580,17 @@ class QlibTrainer:
         config_path.write_text(json.dumps(job.get("config_json") or {}, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
         with model_path.open("wb") as target:
             pickle.dump(model, target)
-        bundle_path = work_dir / "qlib_experiment.tar.gz"
-        with tarfile.open(bundle_path, "w:gz") as archive:
-            for path in [manifest_path, metrics_path, importance_path, training_diagnostics_path, config_path, model_path, predictions_path, dataset_manifest_path]:
-                archive.add(path, arcname=path.name)
-            if optuna_path.is_file():
-                archive.add(optuna_path, arcname=optuna_path.name)
-            if recorder_db.exists():
-                archive.add(recorder_db, arcname=recorder_db.name)
-            if recorder_root.exists():
-                archive.add(recorder_root, arcname="mlruns")
-            walk_forward_root = work_dir / "walk_forward"
-            if walk_forward_root.exists():
-                archive.add(walk_forward_root, arcname="walk_forward")
-        walk_forward_bundle_path = work_dir / "walk_forward_series.tar.gz"
-        if walk_forward_report is not None:
-            with tarfile.open(walk_forward_bundle_path, "w:gz") as archive:
-                archive.add(work_dir / "walk_forward", arcname="walk_forward")
+        members = [(path.name, path) for path in [manifest_path, metrics_path, importance_path,
+                   training_diagnostics_path, config_path, model_path, predictions_path, dataset_manifest_path]]
+        if optuna_path.is_file():
+            members.append((optuna_path.name, optuna_path))
+        if recorder_db.exists():
+            members.append((recorder_db.name, recorder_db))
+        if recorder_root.exists():
+            members.append(('mlruns', recorder_root))
+        bundle_path, walk_forward_bundle_path = package_model_bundle(
+            work_dir, manifest, members, has_windows=walk_forward_report is not None,
+        )
         result = {
             "metrics": metrics,
             "feature_importance": feature_importance,
@@ -725,7 +765,10 @@ def _run_walk_forward(
     experiment_name: str,
     cancellation: CancellationToken | None,
     progress: ProgressCallback | None,
-) -> WalkForwardTrainingResult:
+    distributed: Any = None,
+    only_window: int | None = None,
+) -> WalkForwardTrainingResult | TrainingResult:
+    import qlib
     from qlib.model.trainer import TrainerR
     from qlib.workflow import R
 
@@ -881,6 +924,13 @@ def _run_walk_forward(
             "qlib_recorder_id": recorder.id,
             "qlib_task": task,
             "model_sha256": _file_sha256(window_model_path),
+            "model_params": window_params,
+            "evals_result": window_evals,
+            "dataset_hash": prepared.manifest.get("dataset_hash", ""),
+            "environment": {
+                "python": platform.python_version(), "platform": platform.platform(),
+                "qlib": getattr(qlib, "__version__", "unknown"), **_model_package_version(model_kind),
+            },
         }
         prediction_path = window_root / "prediction.parquet"
         prediction.to_frame("prediction").to_parquet(prediction_path)
@@ -923,14 +973,67 @@ def _run_walk_forward(
         })
         return recorder
 
-    qlib_trainer = TrainerR(
-        experiment_name=experiment_name,
-        train_func=train_task,
-    )
-    with R.uri_context(recorder_uri):
-        recorders = qlib_trainer.train(tasks)
-        qlib_trainer.end_train(recorders)
-    if len(recorders) != total or len(reports) != total:
+    if only_window is not None:
+        if not 1 <= only_window <= total:
+            raise ValueError("分布式窗口序号超出冻结时间结构")
+        with R.uri_context(recorder_uri):
+            train_task(tasks[only_window - 1], experiment_name)
+        window_root = series_root / f"window_{only_window:04d}"
+        bundle = work_dir / f"window_{only_window:04d}.tar.gz"
+        with tarfile.open(bundle, "w:gz") as archive:
+            archive.add(window_root, arcname=window_root.name)
+        return TrainingResult({"window": only_window, "segments": windows[only_window - 1]},
+                              [("window", bundle)], window_root / "prediction.parquet")
+    if distributed is not None:
+        distributed.windows(tasks, raw_params, series_root)
+        for index, segments in enumerate(windows, start=1):
+            window_root = series_root / f"window_{index:04d}"
+            manifest_path = window_root / "manifest.json"
+            saved = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if (saved["window"] != index or saved["series_id"] != model_id
+                    or saved["series_revision"] != model_version
+                    or saved.get("dataset_hash") != prepared.manifest["dataset_hash"]
+                    or saved["segments"] != {k: list(v) for k, v in segments.items()}
+                    or saved["model_sha256"] != _file_sha256(window_root / "model.pkl")
+                    or saved["prediction_sha256"] != _file_sha256(window_root / "prediction.parquet")):
+                raise ValueError("分布式窗口身份、日期或文件摘要不一致，拒绝发布")
+            prediction_paths.append(window_root / "prediction.parquet")
+            reports.append({
+                key: saved[key] for key in ("window", "segments", "metrics", "train_medians",
+                                            "qlib_recorder_id", "effective_date_start", "effective_date_end")
+            })
+            reports[-1]["artifact"] = {
+                "path": f"walk_forward/window_{index:04d}", "model_sha256": saved["model_sha256"],
+                "manifest_sha256": _file_sha256(manifest_path),
+            }
+            reports[-1]['environment'] = saved.get('environment', {})
+            prediction_check = pd.read_parquet(window_root / 'prediction.parquet')['prediction']
+            prediction_dates = pd.to_datetime(prediction_check.index.get_level_values('datetime'))
+            if (prediction_check.empty or not np.isfinite(prediction_check.to_numpy()).all()
+                    or (prediction_dates < pd.Timestamp(segments['test'][0])).any()
+                    or (prediction_dates > pd.Timestamp(segments['test'][1])).any()):
+                raise ValueError('分布式窗口预测为空、非有限值或超出冻结样本外日期')
+            del prediction_check, prediction_dates
+            if index == total:
+                window_frame, _ = _walk_forward_frame(prepared, segments)
+                training_segments = dict(segments)
+                if "valid" not in training_segments:
+                    training_segments["valid"] = training_segments["train"]
+                window_dataset = _dataset_for_model(DataHandlerLP.from_df(window_frame), training_segments,
+                                                    model_kind, raw_params, DatasetH)
+                with (window_root / "model.pkl").open("rb") as stream:
+                    window_model = pickle.load(stream)
+                latest.update(model=window_model, dataset=window_dataset,
+                              evals_result=saved["evals_result"], segments=segments,
+                              model_params=saved["model_params"])
+    else:
+        qlib_trainer = TrainerR(experiment_name=experiment_name, train_func=train_task)
+        with R.uri_context(recorder_uri):
+            recorders = qlib_trainer.train(tasks)
+            qlib_trainer.end_train(recorders)
+        if len(recorders) != total:
+            raise ValueError("Qlib滚动任务训练结果数量与窗口计划不一致")
+    if len(reports) != total:
         raise ValueError("Qlib滚动任务训练结果数量与窗口计划不一致")
 
     predictions = [pd.read_parquet(path)["prediction"] for path in prediction_paths]
@@ -971,6 +1074,7 @@ def _run_walk_forward(
         "prediction_date_start": windows[0]["test"][0],
         "prediction_date_end": windows[-1]["test"][1],
         "orchestration": {
+            "execution_mode": "distributed" if distributed is not None else "sequential",
             "task_generator": "qlib.workflow.task.gen.RollingGen",
             "trainer": "qlib.model.trainer.TrainerR",
             "recorder_per_window": True,
@@ -1942,6 +2046,8 @@ def _tune_tree_hyperparameters(
     classification: bool,
     cancellation: CancellationToken | None,
     progress: ProgressCallback | None,
+    distributed: Any = None,
+    fixed_trial: dict | None = None,
 ) -> dict[str, Any]:
     """Search frozen validation data and return auditable trials.
 
@@ -2183,9 +2289,19 @@ def _tune_tree_hyperparameters(
             raise optuna.TrialPruned("验证集稳健性得分不是有限值")
         return value
 
+    if fixed_trial is not None:
+        trial = optuna.trial.FixedTrial(fixed_trial["params"], number=int(fixed_trial["trial_number"]))
+        try:
+            value = objective(trial)
+            return {"state": "complete", "value": value, "params": dict(trial.params),
+                    "attrs": dict(trial.user_attrs)}
+        except optuna.TrialPruned as exc:
+            return {"state": "pruned", "value": None, "params": dict(trial.params),
+                    "attrs": dict(trial.user_attrs), "reason": str(exc)}
+
     study = optuna.create_study(
         direction="maximize",
-        sampler=optuna.samplers.TPESampler(seed=seed),
+        sampler=optuna.samplers.TPESampler(seed=seed, constant_liar=distributed is not None),
         study_name=f"{model_kind}_validation_rank_icir",
     )
 
@@ -2200,13 +2316,11 @@ def _tune_tree_hyperparameters(
             ),
         })
 
-    study.optimize(
-        objective,
-        n_trials=n_trials,
-        callbacks=[report_trial],
-        show_progress_bar=False,
-        gc_after_trial=True,
-    )
+    if distributed is not None:
+        study = distributed.optimize(study, n_trials, model_kind, report_trial)
+    else:
+        study.optimize(objective, n_trials=n_trials, callbacks=[report_trial],
+                       show_progress_bar=False, gc_after_trial=True)
     completed = [
         trial for trial in study.trials
         if trial.state == optuna.trial.TrialState.COMPLETE
@@ -2232,6 +2346,8 @@ def _tune_tree_hyperparameters(
             if trial.datetime_start is not None and trial.datetime_complete is not None
             else None
         )
+        if distributed is not None:
+            duration = trial.user_attrs.get('distributed_elapsed_seconds')
         trials.append({
             "trial_number": int(trial.number) + 1,
             "state": trial.state.name.lower(),

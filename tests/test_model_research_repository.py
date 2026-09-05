@@ -54,6 +54,52 @@ def _source() -> dict:
     }
 
 
+@pytest.mark.parametrize("has_heartbeat", [False, True])
+def test_resumed_distributed_job_is_worker_json_ready(monkeypatch, tmp_path, has_heartbeat):
+    from factor_service.research.state import JobStateStore
+    from factor_service.training_subtask_repository import TrainingSubtaskRepository
+
+    stamp = datetime(2026, 9, 4, 9, 30, tzinfo=timezone.utc)
+    row = {
+        "job_id": "job-resume", "kind": "train", "status": "queued",
+        "config_json": {"execution": {"mode": "distributed"}},
+        "created_at": stamp,
+    }
+    task = {
+        "task_key": "trial_00000", "kind": "optuna_trial",
+        "node_id": "lan-cpu-05", "state": "failed", "attempt_count": 1,
+        "error": "connection lost", "heartbeat_at": stamp if has_heartbeat else None,
+        "created_at": stamp, "updated_at": stamp, "owner_token": "private-owner",
+    }
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, _statement, params):
+            assert params == ("job-resume",)
+            return SimpleNamespace(fetchone=lambda: row)
+
+    repository = ModelResearchRepository.__new__(ModelResearchRepository)
+    repository.database = SimpleNamespace(connection=Connection)
+    monkeypatch.setattr(repository_module, "_require_attempt_audit_schema", lambda _conn: None)
+    monkeypatch.setattr(TrainingSubtaskRepository, "list", lambda _self, _job_id: [task])
+
+    job = repository.get_job("job-resume")
+    store = JobStateStore(tmp_path)
+    store.save(job, "accepted")
+    assert store.load()["job"] == job
+    subtask = job["subtasks"][0]
+    assert subtask["created_at"] == stamp.isoformat()
+    assert subtask["updated_at"] == stamp.isoformat()
+    assert subtask["heartbeat_at"] == (stamp.isoformat() if has_heartbeat else None)
+    assert "owner_token" not in subtask
+    assert task["created_at"] is stamp
+
+
 def test_create_inference_job_rejects_date_outside_rolling_revision() -> None:
     repository = ModelResearchRepository.__new__(ModelResearchRepository)
     repository.get_model = lambda _model_id, _version: {
@@ -253,6 +299,48 @@ def test_job_row_only_marks_terminal_infrastructure_failure_retryable() -> None:
         **base, "result_json": {"failure": {"retryable": False}},
     })["retryable"] is False
     assert _job_row({**base, "status": "queued"})["retryable"] is False
+
+
+@pytest.mark.parametrize("failure", [
+    {"retryable": False, "error_code": "node_memory_budget_exceeded"},
+    {"retryable": False, "code": "node_out_of_memory"},
+    {"retryable": False, "message": "[node_memory_budget_exceeded] insufficient memory"},
+])
+def test_memory_failure_allows_explicit_retry_only_for_terminal_training(failure):
+    base = {"job_id": "job-memory", "kind": "train", "status": "failed",
+            "result_json": {"failure": failure}}
+    assert _job_row(base)["retryable"] is True
+    assert failure["retryable"] is False  # Audit/automatic retry policy is unchanged.
+    assert _job_row({**base, "status": "running"})["retryable"] is False
+    assert _job_row({**base, "kind": "inference"})["retryable"] is False
+
+
+@pytest.mark.parametrize("failure", [None, {},
+    {"retryable": False, "code": "node_resource_unavailable"},
+    {"retryable": False, "message": "invalid data mentioning node_out_of_memory"},
+])
+def test_unrelated_permanent_failure_is_not_made_retryable(failure):
+    assert _job_row({"job_id": "job-invalid", "kind": "train", "status": "failed",
+                     "result_json": {"failure": failure}})["retryable"] is False
+
+
+def test_legacy_truncated_failure_uses_longer_error_without_changing_audit():
+    from copy import deepcopy
+    from factor_service.model_research_repository import _failure_allows_manual_retry
+    prefix = '[unexpected_error] RuntimeError: 隔离模型进程失败(returncode=1):\n'
+    message = (prefix + 'INFO initialized\n' * 70
+               + 'An exception has been raised[PermanentJobError: Received disconnect from 10.0.0.5 '
+               'port 22:2: Too many authentication failures].\nTraceback')
+    raw = {'job_id': 'old-job', 'kind': 'train', 'status': 'failed', 'error_message': message,
+           'result_json': {'failure': {'retryable': False, 'message': message[:1000]}}}
+    original = deepcopy(raw)
+    result = _job_row(raw)
+    assert result['retryable'] is True
+    assert result['error_message'].startswith('[node_ssh_authentication_failed]')
+    assert 'INFO' not in result['error_message']
+    assert raw == original and result['result_json'] == original['result_json']
+    assert _failure_allows_manual_retry(raw['result_json']['failure'], error_message=message)
+    assert not _failure_allows_manual_retry(raw['result_json']['failure'], error_message=prefix + 'ValueError: bad dataset')
 
 
 class _Cursor:
@@ -836,12 +924,21 @@ def test_dispatch_failure_closes_attempt_without_deleting_or_reusing_ordinal() -
     }
 
 
-def test_manual_retry_preserves_prior_attempt_and_next_claim_appends_ordinal() -> None:
+@pytest.mark.parametrize('failure', [
+    {'retryable': True},
+    {'retryable': False, 'message': '[node_memory_budget_exceeded] NodeMemoryBudgetExceeded: low memory'},
+    {'retryable': False, 'message': '[node_out_of_memory] NodeOutOfMemory: allocation failed'},
+    {'retryable': False, 'error_code': 'node_ssh_authentication_failed'},
+    {'retryable': False, 'error_code': 'node_execution_unavailable'},
+    {'retryable': False, 'message': '[unexpected_error] RuntimeError: 隔离模型进程失败(returncode=1):\n'
+     'An exception has been raised[PermanentJobError: Too many authentication failures].\nTraceback'},
+])
+def test_manual_retry_preserves_prior_attempt_and_next_claim_appends_ordinal(failure) -> None:
     failed = _claimable_job(attempt_count=1, status="failed")
     failed.update({
         "lease_owner": "",
         "lease_token": "",
-        "result_json": {"failure": {"retryable": True}},
+        "result_json": {"failure": failure},
     })
     retry_connection = _RecordingConnection(failed)
     repository = ModelResearchRepository(_RecordingDatabase(retry_connection))

@@ -9,12 +9,16 @@ from dataclasses import asdict, dataclass
 import gc
 import os
 from pathlib import Path
+import re
+import subprocess
 import sys
 
 
 MIB = 1024 ** 2
 GIB = 1024 ** 3
 MEMORY_RESERVE_RATIO = 0.15
+MEMORY_HARD_FLOOR_BYTES = 256 * MIB
+MEMORY_LOW_SAMPLE_LIMIT = 3
 
 
 def _read(path: Path) -> str:
@@ -83,19 +87,75 @@ class RuntimeResources:
     def training_headroom_bytes(self) -> int:
         return max(0, self.memory_available_bytes - self.reserve_bytes)
 
+    @property
+    def runtime_reserve_bytes(self) -> int:
+        # The 15% planning reserve is advisory, not a measured runtime limit.
+        # Keep a bounded emergency margin while allowing a supervised attempt.
+        return max(512 * MIB, min(GIB, int(self.memory_limit_bytes * 0.05)))
+
     def public(self) -> dict[str, int | str | float]:
         return {
             **asdict(self),
             "memory_reserve_bytes": self.reserve_bytes,
             "training_headroom_bytes": self.training_headroom_bytes,
+            "runtime_memory_floor_bytes": self.runtime_reserve_bytes,
             "memory_used_bytes": self.memory_limit_bytes - self.memory_available_bytes,
         }
+
+
+class RuntimeMemoryGuard:
+    """Ignore one low sample, but stop persistent or critically low capacity."""
+
+    def __init__(self) -> None:
+        self.low_samples = 0
+
+    def observe(self, resources: RuntimeResources) -> bool:
+        low = resources.memory_available_bytes < resources.runtime_reserve_bytes
+        self.low_samples = self.low_samples + 1 if low else 0
+        return (resources.memory_available_bytes <= MEMORY_HARD_FLOOR_BYTES
+                or self.low_samples >= MEMORY_LOW_SAMPLE_LIMIT)
+
+
+def _command_output(args: list[str]) -> str:
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, timeout=2, check=False)
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def _darwin_resources(pid: int | None) -> RuntimeResources:
+    hardware = _command_output(["/usr/sbin/sysctl", "-n", "hw.memsize", "hw.logicalcpu"]).splitlines()
+    total = _integer(hardware[0]) if hardware else 0
+    cores = max(1, _integer(hardware[1]) if len(hardware) > 1 else os.cpu_count() or 1)
+    vm = _command_output(["/usr/bin/vm_stat"])
+    page_size = re.search(r"page size of (\d+) bytes", vm)
+    pages = {
+        name: int(count)
+        for name, count in re.findall(r"^(Pages [^:]+):\s+(\d+)\.", vm, re.MULTILINE)
+    }
+    required = ("Pages free", "Pages inactive", "Pages speculative")
+    if total <= 0 or not page_size or not all(name in pages for name in required):
+        # Missing probes must not turn into an invented budget or bypass the guard.
+        return RuntimeResources(cores, 0, 0, "unavailable")
+    # Apple's vm_stat subtracts speculative pages from its displayed free count.
+    # Add them back once, plus inactive reclaimable pages; do not add purgeable
+    # pages again or count compressed/swap space as physical training capacity.
+    available = sum(pages[name] for name in required) * int(page_size.group(1))
+    rss = _integer(_command_output(["/bin/ps", "-o", "rss=", "-p", str(pid or os.getpid())])) * 1024
+    return RuntimeResources(
+        cpu_cores=cores, memory_limit_bytes=total,
+        memory_available_bytes=min(total, max(0, available)),
+        memory_source="darwin_vm_stat", process_rss_bytes=max(0, rss),
+    )
 
 
 def read_runtime_resources(
     *, pid: int | None = None, proc_root: Path = Path("/proc"),
     cgroup_root: Path = Path("/sys/fs/cgroup"),
 ) -> RuntimeResources:
+    if sys.platform == "darwin" and proc_root == Path("/proc") and cgroup_root == Path("/sys/fs/cgroup"):
+        return _darwin_resources(pid)
     memory = _pairs(proc_root / "meminfo")
     total = memory.get("MemTotal", 0) * 1024
     available = memory.get("MemAvailable", memory.get("MemFree", 0)) * 1024

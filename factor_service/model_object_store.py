@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 import re
 import tempfile
+import threading
+import time
 from typing import Any
 from urllib.parse import quote, urlsplit
 
@@ -86,6 +88,7 @@ class ModelObjectStore:
         size_bytes: int,
         dataset_hash: str = "",
         checkpoint: Any = None,
+        progress: Any = None,
     ) -> dict[str, object] | None:
         if not (self.enabled if dataset_hash else self.enabled_for(artifact_kind)):
             return None
@@ -135,6 +138,8 @@ class ModelObjectStore:
             if current is not None and self._matches(
                 current, digest=expected_digest, size_bytes=expected_size,
             ):
+                if progress:
+                    progress(expected_size, expected_size)
                 return self._identity(
                     object_key, current, expected_digest, expected_size,
                     uploaded=False,
@@ -145,7 +150,7 @@ class ModelObjectStore:
                 str(source),
                 content_type=_content_type(clean_file),
                 metadata=metadata,
-                **({"progress": _UploadCheckpoint(checkpoint)} if checkpoint else {}),
+                **({"progress": _UploadCheckpoint(checkpoint, progress, expected_size)} if checkpoint or progress else {}),
             )
             stored = self.client.stat_object(self.config.bucket, object_key)
             if not self._matches(
@@ -159,6 +164,8 @@ class ModelObjectStore:
                 or getattr(stored, "version_id", "")
                 or ""
             )
+            if progress:
+                progress(expected_size, expected_size)
             return self._identity(
                 object_key, stored, expected_digest, expected_size,
                 uploaded=True, version_id=version_id,
@@ -424,14 +431,28 @@ class ModelObjectStore:
 
 
 class _UploadCheckpoint:
-    def __init__(self, checkpoint: Any) -> None:
+    def __init__(self, checkpoint: Any, progress: Any = None, total: int = 0) -> None:
         self.checkpoint = checkpoint
+        self.progress, self.total = progress, total
+        self.done, self.last = 0, 0.0
+        self.lock = threading.Lock()
 
     def set_meta(self, **kwargs: Any) -> None:
-        self.checkpoint()
+        if self.checkpoint:
+            self.checkpoint()
+        if self.progress:
+            self.progress(0, self.total)
 
     def update(self, length: int) -> None:
-        self.checkpoint()
+        if self.checkpoint:
+            self.checkpoint()
+        # MinIO multipart workers may call this concurrently. Bound DB writes.
+        with self.lock:
+            self.done = min(self.total, self.done + max(0, length))
+            now = time.monotonic()
+            if self.progress and now - self.last >= 2:
+                self.last = now
+                self.progress(self.done, self.total)
 
 
 def _is_s3_error(exc: BaseException) -> bool:

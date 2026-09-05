@@ -11,7 +11,8 @@ import time
 from typing import Any, TYPE_CHECKING
 
 from factor_service.research.runtime_resources import (
-    GIB, RuntimeResources, read_runtime_resources, snapshot_memory_estimate,
+    GIB, MEMORY_HARD_FLOOR_BYTES, RuntimeMemoryGuard, RuntimeResources,
+    read_runtime_resources, snapshot_memory_estimate,
 )
 
 if TYPE_CHECKING:
@@ -30,7 +31,11 @@ def main() -> None:
     parser.add_argument("--training-child", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.training_child:
-        _train(args)
+        try:
+            _train(args)
+        except MemoryError:
+            _record_failure(args, "node_out_of_memory", "训练子进程内存分配失败，未发布不完整模型", read_runtime_resources())
+            raise SystemExit(78)
     else:
         raise SystemExit(_supervise(args))
 
@@ -118,8 +123,8 @@ def _supervise(args: argparse.Namespace) -> int:
     if resources.memory_limit_bytes <= 0:
         _record_failure(args, "node_resource_unavailable", "无法读取节点真实内存限制，未启动训练", resources)
         return 78
-    if resources.training_headroom_bytes <= 0:
-        _record_failure(args, "node_memory_budget_exceeded", "节点当前可用内存不足以保留安全余量，未启动训练", resources)
+    if resources.memory_available_bytes <= MEMORY_HARD_FLOOR_BYTES:
+        _record_failure(args, "node_memory_budget_exceeded", "节点当前实际可用内存已低于紧急底线，未启动训练", resources)
         return 78
     env = dict(os.environ)
     requested_threads = max(1, int(env.get("ALPHA_EFFECTIVE_NUM_THREADS") or resources.cpu_cores))
@@ -146,12 +151,20 @@ def _supervise(args: argparse.Namespace) -> int:
     for sig in (signal.SIGTERM, signal.SIGINT):
         previous_handlers[sig] = signal.signal(sig, stopped)
     last_report = 0.0
+    peak_rss = 0
+    memory_guard = RuntimeMemoryGuard()
     try:
         while True:
             tail.update()
             resources = read_runtime_resources(pid=process.pid)
+            peak_rss = max(peak_rss, resources.process_rss_bytes)
             code = process.poll()
             if code is not None:
+                _append_progress(args.progress_path, {
+                    'stage': 'resource_heartbeat', 'percent': 0,
+                    'details': {'resources': {**resources.public(), 'process_peak_rss_bytes': peak_rss},
+                                'resource_sampled_at': time.time(), 'effective_num_threads': threads},
+                })
                 if code in (-signal.SIGKILL, 137) and resources.oom_kill_count > baseline_oom_kills:
                     _record_failure(args, "node_out_of_memory", "训练子进程被节点OOM终止；已保留完成窗口，未发布不完整模型", resources)
                 return code if code >= 0 else 128 - code
@@ -159,20 +172,27 @@ def _supervise(args: argparse.Namespace) -> int:
                 _stop_training_child(process)
                 _record_failure(args, "node_resource_unavailable", "训练期间无法读取节点内存，已安全终止当前训练", resources)
                 return 78
-            if resources.training_headroom_bytes <= 0:
+            if memory_guard.observe(resources):
                 _stop_training_child(process)
                 _record_failure(args, "node_memory_budget_exceeded", (
                     f"节点可用内存{resources.memory_available_bytes / GIB:.2f} GiB"
-                    f"低于安全余量{resources.reserve_bytes / GIB:.2f} GiB；"
+                    f"触发运行期保护（底线{resources.runtime_reserve_bytes / GIB:.2f} GiB，"
+                    f"连续低内存采样{memory_guard.low_samples}次；紧急不足立即停止）；"
                     "已终止当前训练并保留完成窗口，未发布不完整模型"
                 ), resources)
                 return 78
+            if memory_guard.low_samples == 1:
+                _append_progress(args.progress_path, {
+                    "stage": "memory_pressure_warning", "percent": tail.event.get("percent", 1),
+                    "details": {**tail.event.get("details", {}), "resources": resources.public(),
+                                "message": "实际可用内存偏低，继续采样确认"},
+                })
             now = time.monotonic()
             if now - last_report >= 10:
                 _append_progress(args.progress_path, {
                     "stage": "resource_heartbeat", "percent": 0,
                     "details": {
-                        "resources": resources.public(),
+                        "resources": {**resources.public(), "process_peak_rss_bytes": peak_rss},
                         "effective_num_threads": threads,
                         "resource_sampled_at": time.time(),
                     },
@@ -207,11 +227,11 @@ def _train(args: argparse.Namespace) -> None:
         "details": {"estimated_working_set_bytes": required, "resources": resources.public()},
     })
     if required > resources.training_headroom_bytes:
-        _record_failure(args, "node_memory_budget_exceeded", (
-            f"训练工作集估算需要{required / GIB:.2f} GiB，"
-            f"节点安全可用预算仅{resources.training_headroom_bytes / GIB:.2f} GiB；未加载完整数据集"
-        ), resources)
-        raise SystemExit(78)
+        _append_progress(args.progress_path, {
+            "stage": "memory_preflight_warning", "percent": 1,
+            "details": {"estimated_working_set_bytes": required, "resources": resources.public(),
+                        "message": "预估工作集超过规划预算，仍尝试训练；由运行期实际内存保护决定是否停止"},
+        })
 
     settings = Settings(
         # The immutable snapshot must already exist.  These values are deliberately

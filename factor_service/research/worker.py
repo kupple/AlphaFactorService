@@ -31,6 +31,7 @@ from factor_service.research.job import (
 from factor_service.research.state import JobStateStore
 from factor_service.research.snapshot import prune_stale_dataset_staging
 from factor_service.research.dataset_archive import archive_for_settings, DATASET_FILES
+from factor_service.research.execution_progress import ExecutionProgress
 from factor_service.research.trainer import QlibTrainer, TrainingResult
 
 
@@ -40,6 +41,11 @@ ACTIVE_STATUSES = {"leased", "running", "uploading"}
 # heartbeats event-free. This makes the upload/queue chronology available after
 # the user leaves and reopens the training page.
 PERSISTED_PROGRESS_STAGES = frozenset({
+    "distributed_plan", "distributed_task_restoring", "distributed_task_failed",
+    "packaging", "packaged", "rolling_series_ready", "publishing_predictions", "completing",
+    "distributed_started", "distributed_task_started", "distributed_task_completed",
+    "distributed_node_cleanup_pending", "distributed_task_retrying",
+    "distributed_node_memory_failed", "distributed_node_ssh_failed", "distributed_task_reassigned",
     "archiving_dataset",
     "dataset_archived",
     "checking_dataset_snapshot",
@@ -54,10 +60,12 @@ PERSISTED_PROGRESS_STAGES = frozenset({
     "remote_waiting_for_ssh",
     "remote_materializing_dataset",
     "remote_preparing",
+    "remote_dataset_cache_prepared",
     "remote_snapshot_uploaded",
     "remote_resources_ready",
     "remote.remote_runtime_resources",
     "remote.memory_preflight",
+    "remote.memory_preflight_warning", "remote.memory_pressure_warning",
     "remote.node_memory_budget_exceeded",
     "remote.node_out_of_memory",
     "remote.node_resource_unavailable",
@@ -149,6 +157,11 @@ class ResearchWorker:
             "packages": versions,
             "dispatch_mode": "local_and_remote_ssh",
             "execution_nodes": nodes,
+            "distributed_training": {
+                "enabled": True, "max_nodes": 16, "tasks_per_node": 1,
+                "optuna_parallelism": "trial", "walk_forward_parallelism": "window",
+                "storage": "postgresql_and_minio", "remote_nodes_only": True,
+            },
             "service_api_version": "v1",
             "cooperative_cancellation": True,
             "crash_recovery": True,
@@ -305,6 +318,8 @@ class ResearchWorker:
                     "last_result": dict(self.scheduler_last_result),
                 },
                 "dataset_cache": {
+                    "capacity": 1 if self.dataset_archive is not None else None,
+                    "retention_policy": "single_dataset" if self.dataset_archive is not None else "ttl",
                     "storage_mode": (
                         "minio_with_temporary_local_files" if self.dataset_archive is not None
                         else "local_cache"
@@ -403,11 +418,13 @@ class ResearchWorker:
             self.dataset_cache_last_cleanup_at = datetime.now(
                 timezone.utc,
             ).isoformat()
-            self.dataset_cache_last_error = ""
+            self.dataset_cache_last_error = "; ".join(
+                str(item.get("error", "")) for item in result.get("errors", [])
+            )
             self.dataset_cache_last_result = dict(result)
         if result.get("deleted"):
             print(
-                "已清理超过保留期的训练数据集缓存: "
+                "已清理旧训练数据集缓存: "
                 + json.dumps(result, ensure_ascii=False),
                 flush=True,
             )
@@ -466,6 +483,7 @@ class ResearchWorker:
         report_pending = False
         action_label = "每日推理" if job_kind == "infer" else "训练"
         print(f"开始{action_label} {job_id}", flush=True)
+        self.execution_observation = ExecutionProgress()
         self._set_state(
             active_job_id=job_id, last_job_id=job_id,
             last_job_status="running", _active_cancellation=cancellation,
@@ -474,7 +492,16 @@ class ResearchWorker:
         dataset_use = ExitStack()
         try:
             if job_kind == "train":
-                dataset_use.enter_context(self.artifact_store.dataset_usage(str(job["dataset_hash"])))
+                if ((job.get('config_json') or {}).get('walk_forward', {}).get('enabled')
+                        and self.model_object_store.enabled
+                        and not self.model_object_store.enabled_for('walk_forward_series')):
+                    from factor_service.model_object_store import ModelObjectStoreConfigurationError
+                    raise ModelObjectStoreConfigurationError('滚动训练需要启用walk_forward_series归档，不能只归档主模型包')
+                dataset_use.enter_context(
+                    self.dataset_archive.cache_slot(str(job["dataset_hash"]))
+                    if self.dataset_archive is not None
+                    else self.artifact_store.dataset_usage(str(job["dataset_hash"]))
+                )
             self._report_progress(job, cancellation, "validating", 2, {})
             progress_callback = lambda stage, percent, details: self._report_progress(
                 job, cancellation, stage, percent, details,
@@ -493,7 +520,9 @@ class ResearchWorker:
                     )
                     or "local"
                 )
-                if execution_node_id != "local":
+                if ((job.get("config_json") or {}).get("execution") or {}).get("mode") == "distributed":
+                    trained = self._run_isolated_model(job, work_dir, cancellation)
+                elif execution_node_id != "local":
                     from factor_service.research.remote import (
                         RemoteResearchExecutor,
                         get_remote_node,
@@ -513,10 +542,8 @@ class ResearchWorker:
                 else:
                     trained = self._run_isolated_model(job, work_dir, cancellation)
             cancellation.checkpoint()
-            self.control.stage(job_id, lease_token, "uploading", {
-                "stage": "uploading", "percent": 90,
-                "artifact_count": len(trained.artifacts),
-            })
+            self._report_progress(job, cancellation, 'uploading', 90, {'artifact_count': len(trained.artifacts)})
+            self.control.stage(job_id, lease_token, 'uploading', dict(self.current_progress))
             artifact_count = max(1, len(trained.artifacts))
             remote_artifacts: list[dict[str, object]] = []
             for artifact_index, (kind, path) in enumerate(trained.artifacts):
@@ -555,6 +582,12 @@ class ResearchWorker:
                         source_path=saved["path"],
                         digest=str(saved["sha256"]),
                         size_bytes=int(saved["size_bytes"]),
+                        checkpoint=cancellation.checkpoint,
+                        progress=lambda done, total: self._report_progress(
+                            job, cancellation, "uploading_model_archive",
+                            min(96, 90 + int(6 * (artifact_index + done / max(1, total)) / artifact_count)),
+                            {"artifact": kind, "upload_bytes": done, "upload_total_bytes": total},
+                        ),
                     )
                     if remote is not None:
                         remote_artifacts.append(dict(remote))
@@ -607,13 +640,10 @@ class ResearchWorker:
         except Exception as exc:
             retryable, code = classify_exception(exc)
             metadata = error_payload(exc)
-            error = (
-                f"[{code}] {type(exc).__name__}: {exc}\n"
-                f"{traceback.format_exc()}"
-            )
+            error = f"[{code}] {type(exc).__name__}: {exc}"
             terminal = "retry_queued" if retryable else ("canceled" if code == "canceled" else "failed")
             self._set_state(last_job_status=terminal, last_error=str(exc))
-            print(error, file=sys.stderr, flush=True)
+            print(f"{error}\n{traceback.format_exc()}", file=sys.stderr, flush=True)
             try:
                 self.state_store.save(job, "failure_report_pending", {
                     "stage": "failure_report_pending",
@@ -644,8 +674,6 @@ class ResearchWorker:
                     )
         finally:
             dataset_use.close()
-            if self.dataset_archive is not None and job_kind == "train":
-                self.dataset_archive.try_evict(str(job["dataset_hash"]))
             monitor_stop.set()
             if monitor_thread.is_alive():
                 monitor_thread.join(timeout=6)
@@ -667,6 +695,9 @@ class ResearchWorker:
         result_path = work_dir / "isolated_result.json"
         stdout_path = work_dir / "isolated_stdout.log"
         stderr_path = work_dir / "isolated_stderr.log"
+        progress_path = work_dir / "isolated_progress.jsonl"
+        progress_path.unlink(missing_ok=True)
+        progress_offset = 0
         descriptor.write_text(
             json.dumps(job, ensure_ascii=False, sort_keys=True), encoding="utf-8",
         )
@@ -689,17 +720,33 @@ class ResearchWorker:
             try:
                 while process.poll() is None:
                     cancellation.checkpoint()
+                    if progress_path.exists():
+                        with progress_path.open('rb') as events:
+                            events.seek(progress_offset)
+                            for line in events:
+                                if not line.endswith(b'\n'):
+                                    break
+                                progress_offset += len(line)
+                                event = json.loads(line)
+                                self._report_progress(job, cancellation, event['stage'],
+                                                      event['percent'], event['details'])
                     time.sleep(0.5)
             except BaseException:
                 process.terminate()
                 try:
-                    process.wait(timeout=5)
+                    process.wait(timeout=60 if ((job.get('config_json') or {}).get('execution') or {}).get('mode') == 'distributed' else 5)
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=5)
                 raise
         if process.returncode != 0:
             error = stderr_path.read_text(encoding="utf-8", errors="replace")[-20_000:]
+            if result_path.is_file():
+                payload = json.loads(result_path.read_text(encoding='utf-8'))
+                from factor_service.research.errors import restore_job_error
+                restored = restore_job_error(payload)
+                if restored is not None:
+                    raise restored
             raise RuntimeError(
                 f"隔离模型进程失败(returncode={process.returncode}):\n{error}"
             )
@@ -721,7 +768,9 @@ class ResearchWorker:
         details: dict[str, Any],
     ) -> None:
         cancellation.checkpoint()
-        payload = {"stage": stage, "percent": max(0, min(int(percent), 100)), **details}
+        if not hasattr(self, 'execution_observation'):
+            self.execution_observation = ExecutionProgress()
+        payload = self.execution_observation.update(stage, percent, details)
         with self._state_lock:
             previous_stage = str(self.current_progress.get("stage") or "")
         self.state_store.save(job, stage, payload)
